@@ -1,5 +1,7 @@
 # Global SAML Inspector
 
+> **Disclosure:** This is a vibe-coded app built with AI assistance. All source files are available in this repository for inspection before running.
+
 A Windows desktop tool that intercepts, decodes, and displays SAML authentication flows in real time. Acts as a system-wide HTTPS proxy, transparently man-in-the-middles every browser connection, and surfaces SAMLRequest and SAMLResponse payloads in a tabbed GUI — one tab per login flow, named by the authenticated email address.
 
 ---
