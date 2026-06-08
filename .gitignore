@@ -1,0 +1,32 @@
+# Built executables
+*.exe
+
+# PyInstaller artefacts
+build/
+dist/
+*.spec.bak
+
+# Generated version file
+version_info.txt
+_version.py
+
+# Local CA certificates (contain private keys — never commit)
+certs/
+*.key
+*.crt
+*.pem
+
+# App data / logs
+debug.log
+config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
