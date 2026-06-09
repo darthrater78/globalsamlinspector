@@ -8,7 +8,7 @@ a = Analysis(
     ['saml_interceptor.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('saml.ico', '.')],  # bundled for tkinter window icon at runtime
     hiddenimports=[
         # cryptography Rust/cffi internals PyInstaller misses
         'cryptography.hazmat.bindings._rust',
