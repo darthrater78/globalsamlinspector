@@ -30,3 +30,6 @@ venv/
 # IDE
 .vscode/
 .idea/
+
+# Icon build artefacts
+icon_preview.png
