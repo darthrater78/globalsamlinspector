@@ -73,9 +73,15 @@ echo [+] version_info.txt written
 :: ── Install / upgrade dependencies ───────────────────────────────────────────
 echo.
 echo [*] Checking dependencies...
-!PY! -m pip install --quiet --upgrade cryptography pyinstaller pillow
+!PY! -m pip install --quiet --upgrade cryptography pyinstaller pillow bandit
 if errorlevel 1 ( echo [ERROR] pip install failed & pause & exit /b 1 )
 echo [+] Dependencies OK
+
+:: ── Security scan (bandit) ────────────────────────────────────────────────────
+echo.
+echo [*] Running security scan...
+!PY! -m bandit -r saml_interceptor.py -ll --quiet
+if errorlevel 1 ( echo [WARN] bandit reported issues -- review before distributing. ) else ( echo [+] Security scan clean )
 
 :: ── Convert icon (saml.jpg -> saml.ico) ──────────────────────────────────────
 if exist saml.jpg (

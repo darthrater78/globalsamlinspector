@@ -111,7 +111,7 @@ def _find_saml(data: str, post_body: bool) -> list:
                         'decoded': _decode_saml_value(val, redirect_binding=not post_body),
                     })
     except Exception:
-        pass
+        _log.debug("_find_saml parse error", exc_info=True)
     return results
 
 
@@ -494,7 +494,7 @@ def _inet_refresh():
         inet.InternetSetOptionW(0, 39, 0, 0)
         inet.InternetSetOptionW(0, 37, 0, 0)
     except Exception:
-        pass
+        _log.debug("_inet_refresh failed", exc_info=True)
 
 
 class SystemProxy:
@@ -557,7 +557,7 @@ class SAMLProxy:
         self._alive = False
         if self._sock:
             try: self._sock.close()
-            except Exception: pass
+            except Exception: _log.debug("error closing proxy socket", exc_info=True)
             self._sock = None
         if self._pool:
             self._pool.shutdown(wait=False, cancel_futures=True)
@@ -572,6 +572,7 @@ class SAMLProxy:
             except socket.timeout:
                 continue
             except Exception:
+                _log.debug("accept loop error", exc_info=True)
                 break
 
     def _handle(self, sock):
@@ -586,10 +587,10 @@ class SAMLProxy:
             else:
                 self._do_http(sock, data)
         except Exception:
-            pass
+            _log.debug("_handle error", exc_info=True)
         finally:
             try: sock.close()
-            except Exception: pass
+            except Exception: _log.debug("error closing client socket", exc_info=True)
 
     def _do_http(self, sock, data: bytes):
         parts = data.split(b'\r\n')[0].decode('utf-8', errors='replace').split(' ')
@@ -613,10 +614,10 @@ class SAMLProxy:
             if data:
                 self._forward(tls, data, host, port, tls=True)
         except Exception:
-            pass
+            _log.debug("_do_connect forward error", exc_info=True)
         finally:
             try: tls.close()
-            except Exception: pass
+            except Exception: _log.debug("error closing TLS socket", exc_info=True)
 
     def _get_srv_ctx(self, domain: str) -> ssl.SSLContext:
         with self._srv_ctx_lock:
@@ -655,8 +656,9 @@ class SAMLProxy:
         try:
             up = socket.create_connection((host, port), timeout=_TIMEOUT)
         except Exception:
+            _log.debug("upstream connection failed to %s:%s", host, port, exc_info=True)
             try: client.sendall(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
-            except Exception: pass
+            except Exception: _log.debug("error sending 502", exc_info=True)
             return
 
         if tls:
@@ -670,12 +672,13 @@ class SAMLProxy:
         try:
             up.sendall(data)
         except Exception:
+            _log.debug("upstream send failed for %s", host, exc_info=True)
             up.close()
             return
 
         self._relay(client, up, host=host)
         try: up.close()
-        except Exception: pass
+        except Exception: _log.debug("error closing upstream socket", exc_info=True)
 
     def _relay(self, a, b, host: str = ''):
         """Bidirectional relay. Scans client→upstream data for SAML on keep-alive tunnels."""
@@ -702,9 +705,10 @@ class SAMLProxy:
                     except (BlockingIOError, ssl.SSLWantReadError):
                         pass
                     except Exception:
+                        _log.debug("relay socket error", exc_info=True)
                         return
         except Exception:
-            pass
+            _log.debug("relay select error", exc_info=True)
 
     def _relay_scan(self, buf: bytes, host: str) -> bytes:
         """
@@ -756,7 +760,7 @@ class SAMLProxy:
                 _log.info(f"Captured {f['type']} {f['binding']} from {host}{pp.path} (relay)")
                 self._ev.put(entry)
         except Exception:
-            pass
+            _log.debug("_relay_scan SAML parse error", exc_info=True)
 
         if remainder:
             return self._relay_scan(remainder, host)
@@ -1103,7 +1107,7 @@ class App:
                     _log.debug(f"Processing {cap.get('type')} from {cap.get('host')}")
                     self._add_capture(cap)
                 except Exception:
-                    _log.error(f"_add_capture failed:\n{traceback.format_exc()}")
+                    _log.error("_add_capture failed", exc_info=True)
         except queue.Empty:
             pass
         self._root.after(100, self._poll)
@@ -1221,7 +1225,7 @@ class App:
     def _clear(self):
         for flow in self._flows:
             try: self._nb.forget(flow.tab_frame)
-            except Exception: pass
+            except Exception: _log.debug("error removing flow tab", exc_info=True)
         self._flows.clear()
         self._by_req_id.clear()
         self._flow_num = 0
