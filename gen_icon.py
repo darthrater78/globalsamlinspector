@@ -3,19 +3,18 @@ from PIL import Image, ImageDraw
 import math
 
 def draw_icon(size: int) -> Image.Image:
-    img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+    # RGB with solid background — transparent ICOs render badly in Windows shell / PyInstaller
+    img = Image.new('RGB', (size, size), (24, 26, 36))
     d = ImageDraw.Draw(img)
 
     s = size
-    BG      = (24, 26, 36, 255)      # dark navy
-    SHIELD  = (37, 40, 55, 255)      # slightly lighter panel
-    TEAL    = (78, 201, 176, 255)    # #4ec9b0
-    TEAL_D  = (52, 148, 128, 255)    # darker teal for depth
-    LIGHT   = (212, 212, 212, 255)
+    BG      = (24, 26, 36)      # dark navy
+    SHIELD  = (37, 40, 55)      # slightly lighter panel
+    TEAL    = (78, 201, 176)    # #4ec9b0
+    TEAL_D  = (52, 148, 128)    # darker teal for depth
 
-    # ── Background: rounded square ────────────────────────────────────────────
-    r = int(s * 0.18)
-    d.rounded_rectangle([0, 0, s - 1, s - 1], radius=r, fill=BG)
+    # ── Background: solid fill (no transparency — needed for correct ICO rendering)
+    d.rectangle([0, 0, s, s], fill=BG)
 
     # ── Shield shape ─────────────────────────────────────────────────────────
     # A shield: flat top-left/top-right corners, rounded bottom that ends in a point.
@@ -113,6 +112,7 @@ def draw_icon(size: int) -> Image.Image:
 SIZES = [256, 128, 64, 48, 32, 16]
 frames = [draw_icon(sz) for sz in SIZES]
 
+# Save as RGB ICO — solid background ensures correct rendering in Windows shell and PyInstaller
 frames[0].save(
     'saml.ico',
     format='ICO',
@@ -120,3 +120,7 @@ frames[0].save(
     append_images=frames[1:],
 )
 print(f"saml.ico written ({len(SIZES)} sizes: {SIZES})")
+
+# Also save a PNG preview
+frames[0].save('icon_preview.png')
+print("icon_preview.png written")

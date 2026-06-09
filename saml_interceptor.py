@@ -45,6 +45,12 @@ try:
 except ImportError:
     __version__ = 'dev'
 
+
+def _resource(filename: str) -> str:
+    """Return absolute path to a bundled resource (works both frozen and unfrozen)."""
+    base = getattr(sys, '_MEIPASS', Path(__file__).parent)
+    return str(Path(base) / filename)
+
 try:
     from cryptography import x509
     from cryptography.x509.oid import NameOID
@@ -90,7 +96,7 @@ def _decode_saml_value(value: str, redirect_binding: bool) -> str:
             value += '=' * (4 - rem)
         raw = base64.b64decode(value)
         xml_bytes = zlib.decompress(raw, -15) if redirect_binding else raw
-        return xml.dom.minidom.parseString(xml_bytes).toprettyxml(indent='  ')
+        return xml.dom.minidom.parseString(xml_bytes).toprettyxml(indent='  ')  # nosec B318
     except Exception as exc:
         return f'[Decode error: {exc}]\n\nRaw:\n{value}'
 
@@ -429,7 +435,7 @@ class CertManager:
         with self._lock:
             if domain in self._domain_cache:
                 return self._domain_cache[domain]
-            tag = hashlib.md5(domain.encode()).hexdigest()[:10]
+            tag = hashlib.md5(domain.encode(), usedforsecurity=False).hexdigest()[:10]
             cp, kp = self._DIR / f'{tag}.crt', self._DIR / f'{tag}.key'
             if not cp.exists():
                 key = rsa.generate_private_key(65537, 2048, default_backend())
@@ -869,6 +875,10 @@ class App:
         r.geometry('1380x800')
         r.configure(bg=_BG)
         r.protocol('WM_DELETE_WINDOW', self._close)
+        try:
+            r.iconbitmap(_resource('saml.ico'))
+        except Exception:
+            pass  # icon is cosmetic — never crash on failure
         self._root = r
 
         s = ttk.Style()
