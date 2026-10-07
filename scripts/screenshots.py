@@ -33,7 +33,6 @@ from PIL import ImageGrab      # noqa: E402
 
 if sys.platform != 'win32':
     si._dpapi = lambda data, protect: data
-si.__version__ = (REPO / 'VERSION').read_text(encoding='utf-8').strip()
 si.CertManager.is_ca_installed = lambda self: True     # show the usual, set-up state
 si.SystemProxy.recover = lambda self: False
 
@@ -115,6 +114,7 @@ def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     app = si.App()
     root = app._root
+    root.title('SAML Interceptor')         # no version, so the images do not go stale each release
     root.geometry(f'{SIZE[0]}x{SIZE[1]}+40+40')
     root.attributes('-topmost', True)
     root.lift()

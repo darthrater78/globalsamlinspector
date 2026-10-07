@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-10-07
+
+### Fixed
+
+- The "Intercepting on 127.0.0.1:8080" status text could push the Debug and Open Log buttons
+  out of view on a narrow window. The buttons now keep their space and the status text is
+  cut short instead.
+- Group ID links in the response summary used a different font from the values around them
+  and sat out of line; the underline also covered their indent.
+
+### Added
+
+- Screenshots in the README, captured on Windows from made-up sample data by
+  `scripts/screenshots.py`.
+
+### Changed
+
+- README corrections: the release file name and how to check its SHA-256, first-run steps,
+  Firefox 120+ behaviour, what happens if the app is killed while intercepting, and the
+  Windows root-store and HSTS notes.
+
 ## [1.2.0] - 2026-10-07
 
 ### Security
@@ -68,6 +89,7 @@ All notable changes to this project are documented here. The format follows
 
 - Initial public release.
 
+[1.2.1]: https://github.com/darthrater78/globalsamlinspector/releases/tag/v1.2.1
 [1.2.0]: https://github.com/darthrater78/globalsamlinspector/releases/tag/v1.2.0
 [1.1.3]: https://github.com/darthrater78/globalsamlinspector/releases/tag/v1.1.3
 [1.1.2]: https://github.com/darthrater78/globalsamlinspector/releases/tag/v1.1.2

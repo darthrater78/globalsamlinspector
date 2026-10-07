@@ -4,7 +4,7 @@
 
 A Windows desktop tool that intercepts, decodes, and displays SAML authentication flows in real time. Acts as a system-wide HTTPS proxy, transparently man-in-the-middles every browser connection, and surfaces SAMLRequest and SAMLResponse payloads in a tabbed GUI — one tab per login flow, named by the authenticated email address.
 
-[GitHub](https://github.com/darthrater78/globalsamlinspector) · [Release notes for v1.2.0](https://github.com/darthrater78/globalsamlinspector/releases/tag/v1.2.0) · [Changelog](CHANGELOG.md)
+[GitHub](https://github.com/darthrater78/globalsamlinspector) · [Release notes for v1.2.1](https://github.com/darthrater78/globalsamlinspector/releases/tag/v1.2.1) · [Changelog](CHANGELOG.md)
 
 ![A captured login: issuer, identity, validity window and attributes, with Entra role IDs resolved to names](docs/screenshots/summary.png)
 
@@ -107,7 +107,7 @@ If the lookup fails (ID extraction edge case), the fallback routes the response 
 Get `SAMLInterceptor_v<version>.exe` from the [latest release](https://github.com/darthrater78/globalsamlinspector/releases/latest). The exe is not code-signed, so Windows SmartScreen may warn before running it. Each release's notes list the file's SHA-256; to check your download:
 
 ```
-certutil -hashfile SAMLInterceptor_v1.2.0.exe SHA256
+certutil -hashfile SAMLInterceptor_v1.2.1.exe SHA256
 ```
 
 ### First Run
