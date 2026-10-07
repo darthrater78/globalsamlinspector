@@ -18,6 +18,7 @@ Flow:
 import os
 import re
 import sys
+import json
 import webbrowser
 import ssl
 import zlib
@@ -26,8 +27,9 @@ import queue
 import select
 import socket
 import winreg
-import hashlib
 import ctypes
+import tempfile
+import ipaddress
 import logging
 import threading
 import traceback
@@ -36,7 +38,7 @@ import urllib.parse
 import xml.dom.minidom
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, messagebox
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -56,7 +58,6 @@ try:
     from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.hazmat.backends import default_backend
     CRYPTO_OK = True
 except ImportError:
     CRYPTO_OK = False
@@ -88,14 +89,31 @@ def _clean_xml(xml_str: str) -> str:
     return _BLOB_RE.sub(_sub, xml_str)
 
 
+_MAX_SAML = 1024 * 1024   # decoded XML bytes; real assertions are a few KB
+
+
 def _decode_saml_value(value: str, redirect_binding: bool) -> str:
+    """Decode a SAML parameter. The payload comes from whatever site is being visited."""
+    if len(value) > 2 * _MAX_SAML:
+        return '[Decode error: payload too large]'
     try:
         value = urllib.parse.unquote(value)
         rem = len(value) % 4
         if rem:
             value += '=' * (4 - rem)
         raw = base64.b64decode(value)
-        xml_bytes = zlib.decompress(raw, -15) if redirect_binding else raw
+        if redirect_binding:
+            inflater  = zlib.decompressobj(-15)
+            xml_bytes = inflater.decompress(raw, _MAX_SAML)
+            if inflater.unconsumed_tail:
+                raise ValueError('payload too large')
+        else:
+            xml_bytes = raw
+        if len(xml_bytes) > _MAX_SAML:
+            raise ValueError('payload too large')
+        # SAML forbids DTDs, and a DTD is what entity-expansion attacks need.
+        if b'\x00' in xml_bytes or b'<!DOCTYPE' in xml_bytes:
+            raise ValueError('DTD or non-UTF-8 XML is not allowed in SAML')
         return xml.dom.minidom.parseString(xml_bytes).toprettyxml(indent='  ')  # nosec B318
     except Exception as exc:
         return f'[Decode error: {exc}]\n\nRaw:\n{value}'
@@ -254,7 +272,6 @@ _WIDS_ROLES = {
     '4ba39ca4-527c-499a-b93d-d9b492c50246': 'Partner Tier1 Support',
     'e00e864a-17c5-4a4b-9c06-f5b95a8d5bd8': 'Partner Tier2 Support',
     '95e79109-95c0-4d8e-aee3-d01accf2d47b': 'Guest User',
-    '2b499bcd-da44-4968-8aec-78e1674fa64d': 'Guest Inviter',
 }
 
 
@@ -384,29 +401,68 @@ def _build_summary(cap: dict) -> list:
     return out
 
 
+# ─── DPAPI (protects the CA private key at rest) ──────────────────────────────
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [('cbData', ctypes.c_uint32), ('pbData', ctypes.POINTER(ctypes.c_char))]
+
+
+def _dpapi(data: bytes, protect: bool) -> bytes:
+    """Encrypt or decrypt bytes with the current Windows user's DPAPI key."""
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src = _DataBlob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    out = _DataBlob()
+    fn  = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    # 0x1 = CRYPTPROTECT_UI_FORBIDDEN: fail instead of prompting
+    if not fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(out)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(out.pbData)
+
+
 # ─── Certificate manager ──────────────────────────────────────────────────────
 
+_CERTUTIL = str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'certutil.exe')
+
+
 class CertManager:
-    _CA_CN = 'SAML Interceptor Local CA'
-    _DIR   = Path(os.environ.get('APPDATA', '.')) / 'SAMLInterceptor' / 'certs'
+    _CA_CN    = 'SAML Interceptor Local CA'
+    _DIR      = Path(os.environ.get('APPDATA', '.')) / 'SAMLInterceptor' / 'certs'
+    _KEY_FILE = 'ca.key.dpapi'
 
     def __init__(self):
         self._DIR.mkdir(parents=True, exist_ok=True)
-        self._ca_key  = None
-        self._ca_cert = None
-        self._domain_cache: dict = {}
+        self._ca_key   = None
+        self._ca_cert  = None
+        self._leaf_key = None
+        self._ctx_cache: dict = {}
         self._lock = threading.Lock()
         self._load_or_create_ca()
 
     def _load_or_create_ca(self):
-        kp, cp = self._DIR / 'ca.key', self._DIR / 'ca.crt'
+        kp, cp = self._DIR / self._KEY_FILE, self._DIR / 'ca.crt'
+        legacy = self._DIR / 'ca.key'
+        if legacy.exists():
+            # Earlier versions stored the CA key as plaintext PEM: re-wrap it, then remove it.
+            if cp.exists() and not kp.exists():
+                kp.write_bytes(_dpapi(legacy.read_bytes(), protect=True))
+            legacy.unlink()
+        self._purge_leaf_files()
         if kp.exists() and cp.exists():
-            with open(kp, 'rb') as f:
-                self._ca_key = serialization.load_pem_private_key(f.read(), password=None)
-            with open(cp, 'rb') as f:
-                self._ca_cert = x509.load_pem_x509_certificate(f.read())
-            return
-        self._ca_key = rsa.generate_private_key(65537, 2048, default_backend())
+            try:
+                self._ca_key = serialization.load_pem_private_key(
+                    _dpapi(kp.read_bytes(), protect=False), password=None)
+                self._ca_cert = x509.load_pem_x509_certificate(cp.read_bytes())
+                return
+            except (OSError, ValueError):
+                # e.g. profile copied to another machine or user: the key is unrecoverable
+                _log.warning("stored CA key could not be decrypted; generating a new CA",
+                             exc_info=True)
+        self._ca_key = rsa.generate_private_key(65537, 2048)
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self._CA_CN),
                           x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'SAMLInterceptor')])
         self._ca_cert = (
@@ -417,76 +473,101 @@ class CertManager:
             .not_valid_before(datetime.now(timezone.utc))
             .not_valid_after(datetime.now(timezone.utc) + timedelta(days=3650))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(
+                digital_signature=True, key_cert_sign=True, crl_sign=True,
+                content_commitment=False, key_encipherment=False, data_encipherment=False,
+                key_agreement=False, encipher_only=False, decipher_only=False), critical=True)
             .add_extension(x509.SubjectKeyIdentifier.from_public_key(self._ca_key.public_key()),
                            critical=False)
-            .sign(self._ca_key, hashes.SHA256(), default_backend())
+            .sign(self._ca_key, hashes.SHA256())
         )
-        with open(kp, 'wb') as f:
-            f.write(self._ca_key.private_bytes(serialization.Encoding.PEM,
-                serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
-        with open(cp, 'wb') as f:
-            f.write(self._ca_cert.public_bytes(serialization.Encoding.PEM))
+        kp.write_bytes(_dpapi(self._ca_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()), protect=True))
+        cp.write_bytes(self._ca_cert.public_bytes(serialization.Encoding.PEM))
+
+    def _purge_leaf_files(self):
+        """Earlier versions cached per-domain certs and plaintext keys on disk; remove them."""
+        for p in self._DIR.iterdir():
+            if p.suffix in ('.crt', '.key', '.pem') and p.name != 'ca.crt':
+                p.unlink(missing_ok=True)
 
     @property
     def ca_cert_path(self) -> Path:
         return self._DIR / 'ca.crt'
 
-    def leaf_cert_files(self, domain: str) -> tuple:
+    def leaf_context(self, domain: str) -> ssl.SSLContext:
+        """TLS server context presenting a cert for `domain` signed by the local CA."""
         with self._lock:
-            if domain in self._domain_cache:
-                return self._domain_cache[domain]
-            tag = hashlib.md5(domain.encode(), usedforsecurity=False).hexdigest()[:10]
-            cp, kp = self._DIR / f'{tag}.crt', self._DIR / f'{tag}.key'
-            if not cp.exists():
-                key = rsa.generate_private_key(65537, 2048, default_backend())
-                cert = (
-                    x509.CertificateBuilder()
-                    .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain)]))
-                    .issuer_name(self._ca_cert.subject)
-                    .public_key(key.public_key())
-                    .serial_number(x509.random_serial_number())
-                    .not_valid_before(datetime.now(timezone.utc))
-                    .not_valid_after(datetime.now(timezone.utc) + timedelta(days=397))
-                    .add_extension(
-                        x509.SubjectAlternativeName([x509.DNSName(domain),
-                                                     x509.DNSName(f'*.{domain}')]),
-                        critical=False)
-                    .sign(self._ca_key, hashes.SHA256(), default_backend())
-                )
-                with open(kp, 'wb') as f:
-                    f.write(key.private_bytes(serialization.Encoding.PEM,
-                        serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
-                with open(cp, 'wb') as f:
-                    f.write(cert.public_bytes(serialization.Encoding.PEM))
-            self._domain_cache[domain] = (str(cp), str(kp))
-            return self._domain_cache[domain]
+            ctx = self._ctx_cache.get(domain)
+            if ctx is None:
+                ctx = self._ctx_cache[domain] = self._make_leaf_context(domain)
+            return ctx
+
+    def _make_leaf_context(self, domain: str) -> ssl.SSLContext:
+        if self._leaf_key is None:
+            self._leaf_key = rsa.generate_private_key(65537, 2048)   # one per session, memory only
+        try:
+            san = x509.IPAddress(ipaddress.ip_address(domain.strip('[]')))
+        except ValueError:
+            san = x509.DNSName(domain)
+        now  = datetime.now(timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain[:64])]))
+            .issuer_name(self._ca_cert.subject)
+            .public_key(self._leaf_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=5))
+            .not_valid_after(now + timedelta(days=397))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.SubjectAlternativeName([san]), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                self._ca_key.public_key()), critical=False)
+            .sign(self._ca_key, hashes.SHA256())
+        )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        # ssl can only load key material from a file: write it, load it, delete it.
+        fd, tmp = tempfile.mkstemp(dir=self._DIR, suffix='.pem')
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(self._leaf_key.private_bytes(
+                    serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption()))
+                f.write(cert.public_bytes(serialization.Encoding.PEM))
+            ctx.load_cert_chain(tmp)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+        return ctx
 
     def is_ca_installed(self) -> bool:
-        r = subprocess.run(['certutil', '-store', '-user', 'Root'],
+        r = subprocess.run([_CERTUTIL, '-store', '-user', 'Root'],
                            capture_output=True, text=True)
-        return self._CA_CN in r.stdout
+        # Match this exact cert, not just the name: a regenerated CA shares its CN.
+        thumb = self._ca_cert.fingerprint(hashes.SHA1()).hex()  # nosec B303
+        return thumb in r.stdout.replace(' ', '').lower()
 
     def install_ca(self) -> bool:
-        r = subprocess.run(['certutil', '-addstore', '-user', 'Root', str(self.ca_cert_path)],
+        r = subprocess.run([_CERTUTIL, '-addstore', '-user', 'Root', str(self.ca_cert_path)],
                            capture_output=True, text=True)
         return r.returncode == 0
 
     def uninstall_ca(self):
-        subprocess.run(['certutil', '-delstore', '-user', 'Root', self._CA_CN],
+        subprocess.run([_CERTUTIL, '-delstore', '-user', 'Root', self._CA_CN],
                        capture_output=True, text=True)
 
     def regenerate_ca(self):
         """Wipe and recreate the CA cert. Caller is responsible for reinstalling."""
         self.uninstall_ca()
         with self._lock:
-            self._domain_cache.clear()
-        for p in self._DIR.glob('*.crt'):
-            p.unlink(missing_ok=True)
-        for p in self._DIR.glob('*.key'):
-            p.unlink(missing_ok=True)
-        self._ca_key  = None
-        self._ca_cert = None
-        self._load_or_create_ca()
+            self._ctx_cache.clear()
+            self._leaf_key = None
+            (self._DIR / 'ca.crt').unlink(missing_ok=True)
+            (self._DIR / self._KEY_FILE).unlink(missing_ok=True)
+            self._ca_key  = None
+            self._ca_cert = None
+            self._load_or_create_ca()
 
 
 # ─── Windows system proxy ─────────────────────────────────────────────────────
@@ -504,35 +585,69 @@ def _inet_refresh():
 
 
 class SystemProxy:
+    # Original settings are written here before the proxy is switched on, so a
+    # session that crashes or is killed can be undone on the next launch.
+    _STATE = _LOG_DIR / 'proxy_restore.json'
+
     def __init__(self):
         self._orig_enable = None
         self._orig_server = ''
 
+    @staticmethod
+    def _open():
+        return winreg.OpenKey(winreg.HKEY_CURRENT_USER, _INET_REG, 0,
+                              winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE)
+
     def enable(self, host: str, port: int):
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _INET_REG, 0, winreg.KEY_ALL_ACCESS)
-        try:    self._orig_enable, _ = winreg.QueryValueEx(key, 'ProxyEnable')
-        except FileNotFoundError: self._orig_enable = 0
-        try:    self._orig_server, _ = winreg.QueryValueEx(key, 'ProxyServer')
-        except FileNotFoundError: self._orig_server = ''
-        winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, f'{host}:{port}')
-        winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, 1)
-        winreg.CloseKey(key)
+        ours = f'{host}:{port}'
+        with self._open() as key:
+            try:    enable, _ = winreg.QueryValueEx(key, 'ProxyEnable')
+            except FileNotFoundError: enable = 0
+            try:    server, _ = winreg.QueryValueEx(key, 'ProxyServer')
+            except FileNotFoundError: server = ''
+            if enable and server == ours:
+                enable, server = 0, ''   # left over from us; never "restore" to ourselves
+            self._orig_enable, self._orig_server = int(enable), str(server)
+            self._STATE.write_text(
+                json.dumps({'enable': self._orig_enable, 'server': self._orig_server}),
+                encoding='utf-8')
+            winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, ours)
+            winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, 1)
         _inet_refresh()
 
     def disable(self):
         if self._orig_enable is None:
             return
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _INET_REG, 0, winreg.KEY_ALL_ACCESS)
-        winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, self._orig_enable)
-        winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, self._orig_server)
-        winreg.CloseKey(key)
+        with self._open() as key:
+            winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, self._orig_enable)
+            winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, self._orig_server)
+        self._orig_enable = None
+        self._STATE.unlink(missing_ok=True)
         _inet_refresh()
+
+    def recover(self) -> bool:
+        """Restore settings left behind by a session that did not exit cleanly."""
+        try:
+            state  = json.loads(self._STATE.read_text(encoding='utf-8'))
+            enable = 1 if state['enable'] else 0
+            server = state['server']
+            if not isinstance(server, str) or len(server) > 2048:
+                raise ValueError('bad server value')
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError, KeyError, TypeError):
+            _log.warning("unreadable proxy restore file; switching the proxy off", exc_info=True)
+            enable, server = 0, ''
+        self._orig_enable, self._orig_server = enable, server
+        self.disable()
+        return True
 
 
 # ─── Proxy server ─────────────────────────────────────────────────────────────
 
-_BUF     = 65536
-_TIMEOUT = 15
+_BUF      = 65536
+_TIMEOUT  = 15
+_MAX_BODY = 1024 * 1024   # request body bytes buffered for scanning; the rest is relayed
 
 
 class SAMLProxy:
@@ -544,16 +659,17 @@ class SAMLProxy:
         self._sock  = None
         self._alive = False
         self._pool  = None
-        self._srv_ctx: dict = {}
-        self._srv_ctx_lock = threading.Lock()
+        # Upstream servers are verified against the system trust store: the browser
+        # trusts whatever this proxy relays, so the proxy must do the verifying.
         self._up_ctx = ssl.create_default_context()
-        self._up_ctx.check_hostname = False
-        self._up_ctx.verify_mode    = ssl.CERT_NONE
+        self._up_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
     def start(self):
         self._pool  = ThreadPoolExecutor(max_workers=64, thread_name_prefix='proxy')
         self._sock  = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            # Windows: stop another local process from binding the same port alongside us.
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         self._sock.bind((self._host, self._port))
         self._sock.listen(256)
         self._alive = True
@@ -610,7 +726,7 @@ class SAMLProxy:
         port = int(port) if port.isdigit() else 443
         _log.info(f"CONNECT {target}")
         sock.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-        ctx = self._get_srv_ctx(host)
+        ctx = self._certs.leaf_context(host)
         try:
             tls = ctx.wrap_socket(sock, server_side=True)
         except ssl.SSLError:
@@ -625,14 +741,21 @@ class SAMLProxy:
             try: tls.close()
             except Exception: _log.debug("error closing TLS socket", exc_info=True)
 
-    def _get_srv_ctx(self, domain: str) -> ssl.SSLContext:
-        with self._srv_ctx_lock:
-            if domain not in self._srv_ctx:
-                cp, kp = self._certs.leaf_cert_files(domain)
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                ctx.load_cert_chain(cp, kp)
-                self._srv_ctx[domain] = ctx
-            return self._srv_ctx[domain]
+    def _emit(self, entry: dict):
+        """Queue a capture, pre-parsed here so a slow payload cannot stall the UI thread."""
+        decoded = entry['decoded']
+        try:
+            if not decoded.startswith('[Decode error'):
+                entry['clean_xml'] = _clean_xml(decoded)
+            entry['summary'] = _build_summary(entry)
+            if entry['type'] == 'SAMLRequest':
+                entry['saml_id'] = _extract_saml_id(decoded)
+            else:
+                entry['irt']   = _extract_in_response_to(decoded)
+                entry['email'] = _extract_email(decoded)
+        except Exception:
+            _log.debug("capture pre-parse failed", exc_info=True)
+        self._ev.put(entry)
 
     def _forward(self, client, data: bytes, host: str, port: int, tls: bool):
         hdr_end     = data.find(b'\r\n\r\n')
@@ -650,14 +773,14 @@ class SAMLProxy:
         findings = []
         if pp.query:
             findings += _find_saml(pp.query, post_body=False)
-        if method == 'POST' and body:
+        if method == 'POST' and body and len(body) < _MAX_BODY:
             findings += _find_saml(body.decode('utf-8', errors='replace'), post_body=True)
 
         ts = datetime.now().strftime('%H:%M:%S')
         for f in findings:
             entry = {'ts': ts, 'host': host, 'path': pp.path, 'method': method, **f}
             _log.info(f"Captured {f['type']} {f['binding']} from {host}{pp.path}")
-            self._ev.put(entry)
+            self._emit(entry)
 
         try:
             up = socket.create_connection((host, port), timeout=_TIMEOUT)
@@ -668,7 +791,22 @@ class SAMLProxy:
             return
 
         if tls:
-            up = self._up_ctx.wrap_socket(up, server_hostname=host)
+            try:
+                up = self._up_ctx.wrap_socket(up, server_hostname=host)
+            except OSError as exc:
+                # Fail closed: never relay a server whose certificate did not verify.
+                _log.warning("upstream TLS failed for %s:%s: %s", host, port, exc)
+                up.close()
+                reason = getattr(exc, 'verify_message', '') or 'TLS handshake failed'
+                msg = (f'SAML Interceptor refused this connection: the certificate '
+                       f'presented by {host} could not be verified ({reason}).\n').encode()
+                try:
+                    client.sendall(b'HTTP/1.1 502 Bad Gateway\r\n'
+                                   b'Content-Type: text/plain; charset=utf-8\r\n'
+                                   b'Content-Length: %d\r\nConnection: close\r\n\r\n%s'
+                                   % (len(msg), msg))
+                except Exception: _log.debug("error sending 502", exc_info=True)
+                return
 
         if not tls and path.startswith('http'):
             rel  = pp.path + (f'?{pp.query}' if pp.query else '')
@@ -707,7 +845,13 @@ class SAMLProxy:
                                 buf = b''  # guard against memory runaway
                             else:
                                 buf = self._relay_scan(buf, host)
-                        dst.sendall(chunk)
+                        # Send in blocking mode: a non-blocking sendall can stop part-way
+                        # through a large upload or download and lose the rest.
+                        dst.settimeout(_TIMEOUT)
+                        try:
+                            dst.sendall(chunk)
+                        finally:
+                            dst.settimeout(0)
                     except (BlockingIOError, ssl.SSLWantReadError):
                         pass
                     except Exception:
@@ -764,7 +908,7 @@ class SAMLProxy:
                 ts = datetime.now().strftime('%H:%M:%S')
                 entry = {'ts': ts, 'host': host, 'path': pp.path, 'method': 'POST', **f}
                 _log.info(f"Captured {f['type']} {f['binding']} from {host}{pp.path} (relay)")
-                self._ev.put(entry)
+                self._emit(entry)
         except Exception:
             _log.debug("_relay_scan SAML parse error", exc_info=True)
 
@@ -788,7 +932,8 @@ class SAMLProxy:
             if line.lower().startswith('content-length:'):
                 try: cl = int(line.split(':', 1)[1].strip())
                 except ValueError: pass
-        while len(body) < cl:
+        # Buffer only what is worth scanning; _relay streams whatever is left.
+        while len(body) < min(cl, _MAX_BODY):
             chunk = sock.recv(_BUF)
             if not chunk:
                 break
@@ -797,11 +942,14 @@ class SAMLProxy:
 
     @staticmethod
     def _strip_hop_headers(data: bytes) -> bytes:
-        hop = {b'proxy-connection', b'keep-alive', b'te',
-               b'trailers', b'transfer-encoding', b'upgrade'}
-        return b'\r\n'.join(
-            l for l in data.split(b'\r\n')
+        # Headers only: the body is forwarded byte for byte. Transfer-Encoding stays,
+        # because a chunked body is relayed as it arrived.
+        hop = {b'proxy-connection', b'keep-alive', b'te', b'trailers', b'upgrade'}
+        head, sep, body = data.partition(b'\r\n\r\n')
+        head = b'\r\n'.join(
+            l for l in head.split(b'\r\n')
             if l.split(b':')[0].strip().lower() not in hop)
+        return head + sep + body
 
 
 # ─── Flow model ───────────────────────────────────────────────────────────────
@@ -822,28 +970,44 @@ class SAMLFlow:
         self.w_resp_xml     = None
         self.w_req_xml      = None
         self.w_raw          = None
-        self.w_waiting      = None  # unused; kept for compat
 
 
 # ─── GUI palette ──────────────────────────────────────────────────────────────
 
-_BG   = '#1e1e1e'
-_BG2  = '#252526'
-_BG3  = '#2d2d2d'
-_FG   = '#d4d4d4'
-_FG2  = '#858585'
-_SEL  = '#094771'
-_GRN  = '#0e7a0d'
-_RED  = '#b71c1c'
-_TEAL = '#4ec9b0'
-_ERR  = '#f44747'
-_YEL  = '#dcdcaa'
-_BLU  = '#9cdcfe'
-_GRY  = '#6a737d'
-_OK   = '#4ec9b0'
-_WARN = '#ce9178'
-_FONT = ('Segoe UI', 9)
-_MONO = ('Consolas', 10)
+# Every colour and font the UI uses is named here; DESIGN.md documents the roles.
+_BG    = '#1e1e1e'   # content surface
+_BG2   = '#252526'   # tab strip
+_BG3   = '#2d2d2d'   # toolbar, inactive tabs
+_BTN   = '#3c3c3c'   # neutral button
+_FG    = '#d4d4d4'   # text
+_FG2   = '#8f8f8f'   # dim text on _BG
+_FG2R  = '#b0b0b0'   # dim text on raised surfaces (_BG3, _BTN)
+_SEL   = '#094771'   # text selection
+_GRN   = '#0e7a0d'   # start action
+_RED   = '#b71c1c'   # stop action
+_ON_ACCENT = '#ffffff'   # text on _GRN / _RED
+_TEAL  = '#4ec9b0'   # links, focus ring, positive status
+_AMBER = '#e8b339'   # interception active
+_ERR   = '#ff7b72'   # error text
+_YEL   = '#dcdcaa'   # field labels
+_BLU   = '#9cdcfe'   # headings
+_GRY   = '#6a737d'   # rules and dividers
+_OK    = '#4ec9b0'
+_WARN  = '#ce9178'
+_XMLTAG = '#569cd6'
+_BLOB   = '#6a9955'
+_FONT     = ('Segoe UI', 9)
+_FONT_SM  = ('Segoe UI', 8)
+_FONT_LG  = ('Segoe UI', 10, 'bold')
+_FONT_EMPTY = ('Segoe UI', 11)
+_MONO     = ('Consolas', 10)
+_MONO_SM  = ('Consolas', 9)
+_MONO_H1  = ('Consolas', 11, 'bold')
+_MONO_H2  = ('Consolas', 10, 'bold')
+
+_REPO_URL     = 'https://github.com/darthrater78/globalsamlinspector'
+_RELEASES_URL = (_REPO_URL + '/releases/latest' if __version__ == 'dev'
+                 else f'{_REPO_URL}/releases/tag/v{__version__}')
 
 PROXY_HOST = '127.0.0.1'
 PROXY_PORT = 8080
@@ -865,14 +1029,27 @@ class App:
         self._flow_num  = 0
         self._build_ui()
         self._root.after(200, self._update_ca_status)
+        if self._sysproxy.recover():
+            self._root.after(300, lambda: messagebox.showinfo(
+                'Proxy settings restored',
+                'SAML Interceptor did not shut down cleanly last time and had left the '
+                'system proxy pointing at itself.\n\nYour original proxy settings have '
+                'been restored.'))
         self._poll()
 
     # ── Build main window ─────────────────────────────────────────────────────
 
     def _build_ui(self):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)   # crisp text on scaled displays
+        except Exception:
+            _log.debug("could not set DPI awareness", exc_info=True)
         r = tk.Tk()
         r.title(f'SAML Interceptor  v{__version__}')
-        r.geometry('1380x800')
+        scale = r.winfo_fpixels('1i') / 96
+        r.geometry(f'{min(int(1380 * scale), r.winfo_screenwidth() - 80)}x'
+                   f'{min(int(800 * scale), r.winfo_screenheight() - 120)}')
+        r.minsize(int(1180 * scale), int(480 * scale))
         r.configure(bg=_BG)
         r.protocol('WM_DELETE_WINDOW', self._close)
         try:
@@ -887,59 +1064,67 @@ class App:
         s.configure('TLabel',           background=_BG, foreground=_FG)
         s.configure('TPanedwindow',     background=_BG)
         s.configure('TNotebook',        background=_BG2, tabmargins=[0, 2, 0, 0])
-        s.configure('TNotebook.Tab',    background=_BG3, foreground=_FG2,
-                    padding=[14, 6], font=('Segoe UI', 9))
+        s.configure('TNotebook.Tab',    background=_BG3, foreground=_FG2R,
+                    padding=[14, 6], font=_FONT)
         s.map('TNotebook.Tab',          background=[('selected', _BG)],
                                         foreground=[('selected', _FG)])
         # Sub-notebook tabs slightly smaller
         s.configure('Sub.TNotebook',        background=_BG2, tabmargins=[0, 1, 0, 0])
-        s.configure('Sub.TNotebook.Tab',    background=_BG3, foreground=_FG2,
-                    padding=[10, 4], font=('Segoe UI', 8))
+        s.configure('Sub.TNotebook.Tab',    background=_BG3, foreground=_FG2R,
+                    padding=[10, 4], font=_FONT_SM)
+        s.configure('TScrollbar',           background=_BTN, troughcolor=_BG2, bordercolor=_BG2,
+                    arrowcolor=_FG2R, lightcolor=_BTN, darkcolor=_BTN)
+        s.map('TScrollbar',                 background=[('active', _GRY)])
         s.map('Sub.TNotebook.Tab',          background=[('selected', _BG2)],
                                             foreground=[('selected', _FG)])
 
         # ── Toolbar ───────────────────────────────────────────────────────
-        bar = tk.Frame(r, bg=_BG3, height=50)
+        bar = tk.Frame(r, bg=_BG3)
         bar.pack(fill='x')
-        bar.pack_propagate(False)
 
-        self._go_btn = tk.Button(bar, text='▶  Start Intercepting',
-            command=self._toggle, bg=_GRN, fg='white',
-            font=('Segoe UI', 10, 'bold'), relief='flat', padx=14, pady=9, cursor='hand2')
-        self._go_btn.pack(side='left', padx=10, pady=6)
+        def button(text, cmd, side='left', **kw):
+            opts = dict(bg=_BTN, fg=_FG, font=_FONT, relief='flat', padx=10, pady=9,
+                        cursor='hand2', highlightthickness=1,
+                        highlightbackground=_BG3, highlightcolor=_TEAL)   # keyboard focus ring
+            opts.update(kw)
+            b = tk.Button(bar, text=text, command=cmd, **opts)
+            b.pack(side=side, padx=3, pady=6)
+            return b
 
-        _btn = lambda text, cmd: tk.Button(bar, text=text, command=cmd,
-            bg='#3c3c3c', fg=_FG, font=_FONT, relief='flat',
-            padx=10, pady=9, cursor='hand2')
+        def divider(side='left'):
+            tk.Frame(bar, bg=_GRY, width=1).pack(side=side, fill='y', padx=8, pady=12)
 
-        _btn('Install CA', self._install_ca).pack(side='left', padx=3, pady=6)
-        _btn('Remove CA',  self._remove_ca ).pack(side='left', padx=3, pady=6)
-        _btn('Regen CA',   self._regen_ca  ).pack(side='left', padx=3, pady=6)
-        _btn('View Cert',  self._view_cert ).pack(side='left', padx=3, pady=6)
-        _btn('Clear',      self._clear     ).pack(side='left', padx=3, pady=6)
+        tk.Frame(bar, bg=_BG3, width=7).pack(side='left')
+        self._go_btn = button('▶  Start Intercepting', self._toggle,
+                              bg=_GRN, fg=_ON_ACCENT, font=_FONT_LG, padx=14)
+        divider()
+        button('Install CA', self._install_ca)
+        button('Remove CA',  self._remove_ca)
+        button('Regen CA',   self._regen_ca)
+        button('View Cert',  self._view_cert)
+        divider()
+        button('Clear',      self._clear)
 
-        self._status = tk.Label(bar, text='● Stopped', bg=_BG3, fg=_ERR, font=_FONT)
+        self._status = tk.Label(bar, text='● Stopped', bg=_BG3, fg=_FG2R, font=_FONT)
         self._status.pack(side='left', padx=16)
 
-        self._ca_status = tk.Label(bar, text='CA …', bg=_BG3, fg=_FG2, font=_FONT)
+        self._ca_status = tk.Label(bar, text='CA …', bg=_BG3, fg=_FG2R, font=_FONT)
         self._ca_status.pack(side='left', padx=6)
 
-        tk.Label(bar, text=f'Proxy  {PROXY_HOST}:{PROXY_PORT}',
-                 bg=_BG3, fg=_FG2, font=('Consolas', 9)).pack(side='right', padx=14)
-
-        tk.Button(bar, text='Open Log', command=self._open_log,
-                  bg='#3c3c3c', fg=_FG, font=_FONT, relief='flat',
-                  padx=10, pady=9, cursor='hand2'
-                  ).pack(side='right', padx=3, pady=6)
-
-        self._debug_btn = tk.Button(bar, text='Debug: Off', command=self._toggle_debug,
-                  bg='#3c3c3c', fg=_FG2, font=_FONT, relief='flat',
-                  padx=10, pady=9, cursor='hand2')
-        self._debug_btn.pack(side='right', padx=3, pady=6)
+        tk.Frame(bar, bg=_BG3, width=7).pack(side='right')
+        button('Release notes', lambda: webbrowser.open(_RELEASES_URL), side='right',
+               bg=_BG3, fg=_TEAL)
+        button('GitHub', lambda: webbrowser.open(_REPO_URL), side='right', bg=_BG3, fg=_TEAL)
+        divider('right')
+        button('Open Log', self._open_log, side='right')
+        self._debug_btn = button('Debug: Off', self._toggle_debug, side='right', fg=_FG2R)
 
         # ── Flow notebook ────────────────────────────────────────────────
         self._nb = ttk.Notebook(r)
         self._nb.pack(fill='both', expand=True)
+        self._nb.bind('<Button-2>', self._on_tab_click)    # middle-click closes a flow
+        self._nb.bind('<Button-3>', self._on_tab_click)
+        r.bind('<Control-w>', lambda e: self._close_flow(self._current_flow()))
 
         # Empty-state frame shown when no flows exist
         self._empty = tk.Frame(self._nb, bg=_BG)
@@ -947,7 +1132,7 @@ class App:
         tk.Label(self._empty,
                  text='Start intercepting, then trigger a SAML login.\n'
                       'Each login attempt will appear as a tab named by email address.',
-                 bg=_BG, fg=_FG2, font=('Segoe UI', 11), justify='center'
+                 bg=_BG, fg=_FG2, font=_FONT_EMPTY, justify='center'
                  ).place(relx=0.5, rely=0.5, anchor='center')
 
     # ── Flow tab builder ──────────────────────────────────────────────────────
@@ -956,7 +1141,7 @@ class App:
         frame = tk.Frame(self._nb, bg=_BG)
 
         # Remove empty-state tab if this is our first flow
-        if len(self._flows) == 1 and self._empty.winfo_ismapped():
+        if str(self._empty) in self._nb.tabs():
             self._nb.forget(self._empty)
 
         self._nb.add(frame, text=f'  Flow {flow.num}  ')
@@ -970,23 +1155,35 @@ class App:
         flow.w_req_sum  = self._make_text_tab(sub, 'Request')
         flow.w_resp_xml = self._make_text_tab(sub, 'Resp. XML')
         flow.w_req_xml  = self._make_text_tab(sub, 'Req. XML')
-        flow.w_raw      = self._make_text_tab(sub, 'Raw')
+        flow.w_raw      = self._make_text_tab(sub, 'Raw', wrap='char')   # one very long line
 
         # Show waiting placeholder as text (avoids z-order issues with a floating Label)
         flow.w_resp_sum.configure(state='normal')
         flow.w_resp_sum.insert('end', '\n\n\n  Waiting for SAMLResponse…', 'dim')
         flow.w_resp_sum.configure(state='disabled')
 
-    def _make_text_tab(self, nb, title: str) -> scrolledtext.ScrolledText:
+    def _make_text_tab(self, nb, title: str, wrap: str = 'none') -> tk.Text:
         frame = tk.Frame(nb, bg=_BG)
         nb.add(frame, text=f' {title} ')
-        t = scrolledtext.ScrolledText(frame, bg=_BG, fg=_FG, font=_MONO,
-            wrap='none', insertbackground='white', selectbackground=_SEL,
+        t = tk.Text(frame, bg=_BG, fg=_FG, font=_MONO,
+            wrap=wrap, insertbackground=_FG, selectbackground=_SEL,
             relief='flat', borderwidth=0, state='disabled')
-        t.pack(fill='both', expand=True)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        ys = ttk.Scrollbar(frame, orient='vertical', command=t.yview)
+        t.configure(yscrollcommand=ys.set)
+        t.grid(row=0, column=0, sticky='nsew')
+        ys.grid(row=0, column=1, sticky='ns')
+        if wrap == 'none':
+            xs = ttk.Scrollbar(frame, orient='horizontal', command=t.xview)
+            t.configure(xscrollcommand=xs.set)
+            xs.grid(row=1, column=0, sticky='ew')
+        # A read-only Text does not take focus on click, so a selection could not be copied.
+        t.bind('<Button-1>', lambda e: t.focus_set())
+        t.bind('<Button-3>', lambda e: self._text_menu(e, t))
         # Text tags
-        t.tag_configure('h1',    foreground=_BLU,  font=('Consolas', 11, 'bold'))
-        t.tag_configure('h2',    foreground=_BLU,  font=('Consolas', 10, 'bold'))
+        t.tag_configure('h1',    foreground=_BLU,  font=_MONO_H1)
+        t.tag_configure('h2',    foreground=_BLU,  font=_MONO_H2)
         t.tag_configure('sep',   foreground=_GRY)
         t.tag_configure('dim',   foreground=_FG2)
         t.tag_configure('label', foreground=_YEL)
@@ -994,16 +1191,63 @@ class App:
         t.tag_configure('ok',    foreground=_OK)
         t.tag_configure('warn',  foreground=_WARN)
         t.tag_configure('err',   foreground=_ERR)
-        t.tag_configure('blob',  foreground='#6a9955', font=('Consolas', 9))
-        t.tag_configure('xmltag',foreground='#569cd6')
+        t.tag_configure('blob',  foreground=_BLOB, font=_MONO_SM)
+        t.tag_configure('xmltag',foreground=_XMLTAG)
         return t
+
+    def _menu(self) -> tk.Menu:
+        return tk.Menu(self._root, tearoff=0, bg=_BG3, fg=_FG,
+                       activebackground=_SEL, activeforeground=_FG)
+
+    def _text_menu(self, event, widget: tk.Text):
+        def copy(text: str):
+            self._root.clipboard_clear()
+            self._root.clipboard_append(text)
+        menu = self._menu()
+        menu.add_command(label='Copy', command=lambda: copy(widget.get('sel.first', 'sel.last')),
+                         state='normal' if widget.tag_ranges('sel') else 'disabled')
+        menu.add_command(label='Copy all', command=lambda: copy(widget.get('1.0', 'end-1c')))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    # ── Closing flows ─────────────────────────────────────────────────────────
+
+    def _current_flow(self):
+        selected = self._nb.select()
+        return next((f for f in self._flows if str(f.tab_frame) == selected), None)
+
+    def _on_tab_click(self, event):
+        try:
+            tab_id = self._nb.tabs()[self._nb.index(f'@{event.x},{event.y}')]
+        except (tk.TclError, IndexError):
+            return
+        flow = next((f for f in self._flows if str(f.tab_frame) == tab_id), None)
+        if flow is None:
+            return
+        if event.num == 2:
+            self._close_flow(flow)
+            return
+        menu = self._menu()
+        menu.add_command(label='Close this flow', command=lambda: self._close_flow(flow))
+        menu.add_command(label='Close all flows', command=self._clear)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _close_flow(self, flow):
+        if flow is None:
+            return
+        self._nb.forget(flow.tab_frame)
+        flow.tab_frame.destroy()
+        self._flows.remove(flow)
+        if self._by_req_id.get(flow.request_id) is flow:
+            del self._by_req_id[flow.request_id]
+        if not self._flows:
+            self._nb.add(self._empty, text='  No flows yet  ')
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
-    def _render_summary(self, cap: dict, widget: scrolledtext.ScrolledText):
+    def _render_summary(self, cap: dict, widget: tk.Text):
         widget.configure(state='normal')
         widget.delete('1.0', 'end')
-        for tag, text in _build_summary(cap):
+        for tag, text in cap.get('summary') or _build_summary(cap):
             if tag == 'guid':
                 guid = text.strip()
                 url  = (f'https://portal.azure.com/#view/Microsoft_AAD_IAM/'
@@ -1022,14 +1266,15 @@ class App:
                 widget.insert('end', text, tag)
         widget.configure(state='disabled')
 
-    def _render_xml(self, decoded: str, widget: scrolledtext.ScrolledText):
+    def _render_xml(self, cap: dict, widget: tk.Text):
+        decoded = cap.get('decoded', '')
         widget.configure(state='normal')
         widget.delete('1.0', 'end')
         if decoded.startswith('[Decode error'):
             widget.insert('1.0', decoded, 'err')
             widget.configure(state='disabled')
             return
-        cleaned = _clean_xml(decoded)
+        cleaned = cap.get('clean_xml') or _clean_xml(decoded)
         for line in cleaned.splitlines(keepends=True):
             if '[base64 chars]' in line:
                 widget.insert('end', line, 'blob')
@@ -1043,7 +1288,7 @@ class App:
                     widget.insert('end', line, 'value')
         widget.configure(state='disabled')
 
-    def _render_raw(self, flow: SAMLFlow, widget: scrolledtext.ScrolledText):
+    def _render_raw(self, flow: SAMLFlow, widget: tk.Text):
         widget.configure(state='normal')
         widget.delete('1.0', 'end')
         if flow.request:
@@ -1078,17 +1323,17 @@ class App:
         kind    = cap['type']
 
         if kind == 'SAMLRequest':
-            req_id = _extract_saml_id(decoded)
+            req_id = cap['saml_id'] if 'saml_id' in cap else _extract_saml_id(decoded)
             _log.debug(f"SAMLRequest req_id={req_id!r} host={cap.get('host')}")
             flow   = self._new_flow(cap, req_id)
             flow.request = cap
-            self._render_xml(decoded, flow.w_req_xml)
+            self._render_xml(cap, flow.w_req_xml)
             # Request summary
             self._render_summary(cap, flow.w_req_sum)
             self._render_raw(flow, flow.w_raw)
 
         elif kind == 'SAMLResponse':
-            irt  = _extract_in_response_to(decoded)
+            irt  = cap['irt'] if 'irt' in cap else _extract_in_response_to(decoded)
             flow = self._by_req_id.get(irt) if irt else None
             _log.debug(f"SAMLResponse irt={irt!r} -> {'Flow '+str(flow.num) if flow else 'no match'}")
             if flow is None:
@@ -1101,10 +1346,10 @@ class App:
             if flow is None:
                 flow = self._new_flow(cap, '')
             flow.response = cap
-            flow.email    = _extract_email(decoded)
+            flow.email    = cap['email'] if 'email' in cap else _extract_email(decoded)
             self._update_tab_title(flow)
             self._render_summary(cap, flow.w_resp_sum)
-            self._render_xml(decoded, flow.w_resp_xml)
+            self._render_xml(cap, flow.w_resp_xml)
             self._render_raw(flow, flow.w_raw)
 
     # ── Poll queue ────────────────────────────────────────────────────────────
@@ -1146,7 +1391,7 @@ class App:
             self._sysproxy.enable(PROXY_HOST, PROXY_PORT)
             self._running = True
             self._go_btn.configure(text='■  Stop Intercepting', bg=_RED)
-            self._status.configure(text='● Intercepting', fg=_TEAL)
+            self._status.configure(text=f'● Intercepting on {PROXY_HOST}:{PROXY_PORT}', fg=_AMBER)
         except Exception as exc:
             messagebox.showerror('Error', f'Could not start proxy:\n{exc}')
 
@@ -1155,10 +1400,10 @@ class App:
         self._proxy.stop()
         self._running = False
         self._go_btn.configure(text='▶  Start Intercepting', bg=_GRN)
-        self._status.configure(text='● Stopped', fg=_ERR)
+        self._status.configure(text='● Stopped', fg=_FG2R)
 
     def _update_ca_status(self):
-        self._ca_status.configure(text='CA: Checking…', fg=_FG2)
+        self._ca_status.configure(text='CA: Checking…', fg=_FG2R)
         def _check():
             installed = self._certs.is_ca_installed()
             self._root.after(0, lambda: self._ca_status.configure(
@@ -1182,9 +1427,19 @@ class App:
                 f'→ Trusted Root Certification Authorities')
 
     def _remove_ca(self):
+        if not messagebox.askyesno('Remove CA',
+                'Remove the local CA from your Trusted Root store?\n\n'
+                'HTTPS flows cannot be decoded until it is installed again.'):
+            return
         self._certs.uninstall_ca()
         self._update_ca_status()
-        messagebox.showinfo('CA Removed', 'Local CA removed from Trusted Root store.')
+        if self._certs.is_ca_installed():
+            messagebox.showwarning('CA Not Removed',
+                'certutil could not remove the CA.  Remove it manually:\n\n'
+                'certmgr.msc → Trusted Root Certification Authorities → Certificates\n'
+                f'→ delete "{self._certs._CA_CN}"')
+        else:
+            messagebox.showinfo('CA Removed', 'Local CA removed from Trusted Root store.')
 
     def _view_cert(self):
         p = self._certs.ca_cert_path
@@ -1221,9 +1476,9 @@ class App:
         _log.setLevel(level)
         _log_handler.setLevel(level)
         if self._debug_on:
-            self._debug_btn.configure(text='Debug: On', bg=_TEAL, fg='black')
+            self._debug_btn.configure(text='Debug: On', bg=_TEAL, fg=_BG)
         else:
-            self._debug_btn.configure(text='Debug: Off', bg='#3c3c3c', fg=_FG2)
+            self._debug_btn.configure(text='Debug: Off', bg=_BTN, fg=_FG2R)
 
     def _open_log(self):
         log_path = _LOG_DIR / 'debug.log'
@@ -1233,8 +1488,13 @@ class App:
             messagebox.showinfo('No Log', f'Debug log not yet created.\n{log_path}')
 
     def _clear(self):
+        if self._flows and not messagebox.askyesno(
+                'Clear captures', f'Discard {len(self._flows)} captured flow(s)?'):
+            return
         for flow in self._flows:
-            try: self._nb.forget(flow.tab_frame)
+            try:
+                self._nb.forget(flow.tab_frame)
+                flow.tab_frame.destroy()
             except Exception: _log.debug("error removing flow tab", exc_info=True)
         self._flows.clear()
         self._by_req_id.clear()

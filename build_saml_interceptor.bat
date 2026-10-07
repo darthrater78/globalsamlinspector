@@ -1,6 +1,10 @@
 @echo off
 setlocal enabledelayedexpansion
 
+:: CI has no console to wait on; "break" is a no-op there.
+set "PAUSE=pause"
+if defined CI set "PAUSE=break"
+
 echo ============================================================
 echo  SAML Interceptor -- Build
 echo ============================================================
@@ -14,14 +18,14 @@ if not defined PY (
 )
 if not defined PY (
     echo [ERROR] Python not found. Install Python 3.10+ from https://python.org
-    pause & exit /b 1
+    %PAUSE% & exit /b 1
 )
 for /f "tokens=*" %%v in ('!PY! --version 2^>^&1') do echo [+] %%v
 
 :: ── Read VERSION ─────────────────────────────────────────────────────────────
 if not exist VERSION (
     echo [ERROR] VERSION file not found.
-    pause & exit /b 1
+    %PAUSE% & exit /b 1
 )
 set /p VERSION=<VERSION
 set VERSION=%VERSION: =%
@@ -73,15 +77,30 @@ echo [+] version_info.txt written
 :: ── Install / upgrade dependencies ───────────────────────────────────────────
 echo.
 echo [*] Checking dependencies...
-!PY! -m pip install --quiet --upgrade cryptography pyinstaller pillow bandit
-if errorlevel 1 ( echo [ERROR] pip install failed & pause & exit /b 1 )
+!PY! -m pip install --quiet -r requirements.txt
+if errorlevel 1 ( echo [ERROR] pip install failed & %PAUSE% & exit /b 1 )
 echo [+] Dependencies OK
 
 :: ── Security scan (bandit) ────────────────────────────────────────────────────
 echo.
 echo [*] Running security scan...
 !PY! -m bandit -r saml_interceptor.py -ll --quiet
-if errorlevel 1 ( echo [WARN] bandit reported issues -- review before distributing. ) else ( echo [+] Security scan clean )
+if errorlevel 1 ( echo [ERROR] bandit reported issues. & %PAUSE% & exit /b 1 )
+echo [+] Security scan clean
+
+:: ── Dependency audit (pip-audit) ─────────────────────────────────────────────
+echo.
+echo [*] Auditing dependencies...
+!PY! -m pip_audit -r requirements.txt
+if errorlevel 1 ( echo [ERROR] pip-audit reported vulnerable dependencies. & %PAUSE% & exit /b 1 )
+echo [+] Dependencies have no known vulnerabilities
+
+:: ── Tests ────────────────────────────────────────────────────────────────────
+echo.
+echo [*] Running tests...
+!PY! -m unittest discover -s tests
+if errorlevel 1 ( echo [ERROR] Tests failed. & %PAUSE% & exit /b 1 )
+echo [+] Tests passed
 
 :: ── Convert icon (saml.jpg -> saml.ico) ──────────────────────────────────────
 if exist saml.jpg (
@@ -100,13 +119,13 @@ if exist build rmdir /s /q build
 echo.
 echo [*] Running PyInstaller...
 !PY! -m PyInstaller saml_interceptor.spec --noconfirm
-if errorlevel 1 ( echo. & echo [ERROR] PyInstaller failed. & pause & exit /b 1 )
+if errorlevel 1 ( echo. & echo [ERROR] PyInstaller failed. & %PAUSE% & exit /b 1 )
 
 :: ── Rename output exe with version tag ──────────────────────────────────────
 set OUT=SAMLInterceptor_v%VERSION%.exe
 if not exist "dist\SAMLInterceptor.exe" (
     echo [ERROR] dist\SAMLInterceptor.exe not found.
-    pause & exit /b 1
+    %PAUSE% & exit /b 1
 )
 move /y "dist\SAMLInterceptor.exe" "%OUT%" >nul
 
@@ -119,8 +138,10 @@ del /f /q version_info.txt
 echo.
 echo ============================================================
 for %%F in (%OUT%) do echo   %%~nxF   ^(%%~zF bytes^)
+echo   SHA-256 ^(publish this with the release^):
+certutil -hashfile "%OUT%" SHA256 | findstr /v /c:"hash" /c:"CertUtil"
 echo ============================================================
 echo.
 echo  To bump the version, edit VERSION and rebuild.
 echo.
-pause
+%PAUSE%

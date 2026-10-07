@@ -12,7 +12,6 @@ a = Analysis(
     hiddenimports=[
         # cryptography Rust/cffi internals PyInstaller misses
         'cryptography.hazmat.bindings._rust',
-        'cryptography.hazmat.bindings._rust.x509',
         'cryptography.hazmat.backends.openssl',
         'cryptography.hazmat.backends.openssl.backend',
         'cryptography.hazmat.primitives.asymmetric.padding',
@@ -54,7 +53,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,              # packed exes trip antivirus heuristics and hide the contents
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,          # no black console window
