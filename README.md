@@ -4,6 +4,8 @@
 
 A Windows desktop tool that intercepts, decodes, and displays SAML authentication flows in real time. Acts as a system-wide HTTPS proxy, transparently man-in-the-middles every browser connection, and surfaces SAMLRequest and SAMLResponse payloads in a tabbed GUI — one tab per login flow, named by the authenticated email address.
 
+[GitHub](https://github.com/darthrater78/globalsamlinspector) · [Release notes for v1.2.0](https://github.com/darthrater78/globalsamlinspector/releases/tag/v1.2.0) · [Changelog](CHANGELOG.md)
+
 ---
 
 ## Use Cases
@@ -42,7 +44,7 @@ Browser ──CONNECT──▶ Local Proxy (127.0.0.1:8080)
                     Queue (thread-safe)
                           │
                ┌──────────┴──────────┐
-               │  _poll() / tkinter  │  100ms poll, decodes + renders
+               │  _poll() / tkinter  │  100ms poll, renders pre-parsed
                │  GUI                │  captures into flow tabs
                └─────────────────────┘
 ```
@@ -51,12 +53,12 @@ Browser ──CONNECT──▶ Local Proxy (127.0.0.1:8080)
 
 | Component | Description |
 |---|---|
-| `SAMLProxy` | Raw TCP server on `127.0.0.1:8080`. `ThreadPoolExecutor(64)` handles concurrent connections. Recreated on each Start so Stop→Start works without restarting the app. |
+| `SAMLProxy` | Raw TCP server on `127.0.0.1:8080`. `ThreadPoolExecutor(64)` handles concurrent connections. Recreated on each Start so Stop→Start works without restarting the app. Verifies every upstream server certificate against the Windows trust store and answers `502` instead of relaying one that fails. Parses captures on its worker threads before queueing them for the GUI. |
 | `CertManager` | Generates a local CA cert + RSA key on first run (stored in `%APPDATA%\SAMLInterceptor\certs\`; the private key is encrypted with Windows DPAPI). Issues per-domain leaf certs on demand, held in memory only. Installs/removes CA via `certutil -addstore/-delstore -user Root`. |
-| `SystemProxy` | Writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` and calls `InternetSetOptionW` to make the change live without a browser restart. Restores original settings on Stop. |
+| `SystemProxy` | Writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` and calls `InternetSetOptionW` to make the change live without a browser restart. Restores original settings on Stop. The original settings are also saved to `%APPDATA%\SAMLInterceptor\proxy_restore.json` first, so a session that crashed or was killed is undone on the next launch. |
 | `_relay_scan` | Buffers client→upstream bytes on keep-alive CONNECT tunnels. Bails immediately for non-POST or non-`application/x-www-form-urlencoded` traffic (zero overhead for downloads, API calls, streaming). Only buffers small form-encoded POSTs — the exact shape of a SAMLResponse. |
 | `_build_summary` | Regex-based SAML XML parser. Extracts issuer, destination, NameID, validity window, and all attributes. Resolves Entra `wids` GUIDs to built-in role names. Renders Entra group GUIDs as clickable links to the Azure portal. |
-| `App` / tkinter | Dark-themed `ttk.Notebook` GUI. Each SAML login flow gets a tab named by email. Five sub-tabs per flow: Response summary, Request summary, Response XML, Request XML, Raw base64. |
+| `App` / tkinter | Dark-themed `ttk.Notebook` GUI. Each SAML login flow gets a tab named by email. Five sub-tabs per flow: Response summary, Request summary, Response XML, Request XML, Raw base64. Middle-click or Ctrl+W closes a flow; right-click a text pane to copy. Colours, fonts and layout rules are in [`DESIGN.md`](DESIGN.md). |
 
 ### SAML Capture Paths
 
@@ -97,7 +99,7 @@ If the lookup fails (ID extraction edge case), the fallback routes the response 
 | Button | Action |
 |---|---|
 | Install CA | Adds local CA to Windows Trusted Root (current user) |
-| Remove CA | Removes it |
+| Remove CA | Removes it, after confirmation, and reports whether removal worked |
 | Regen CA | Wipes and regenerates the CA + all leaf certs, then reinstalls |
 | View Cert | Opens the CA cert in Windows' native certificate viewer |
 
@@ -106,6 +108,19 @@ The CA status indicator in the toolbar shows **CA ✓ Installed** or **CA ✗ No
 ### Debug Logging
 
 Click **Debug: Off** to toggle detailed proxy logging. While it is on, the log records the host and path of every request that passes through the proxy, not only SAML traffic, so turn it off when you are done. Logs write to `%APPDATA%\SAMLInterceptor\debug.log`. Click **Open Log** to open it in your default text editor.
+
+### What Is Stored on Disk
+
+Everything lives under `%APPDATA%\SAMLInterceptor\`.
+
+| File | Contents | Encrypted at rest |
+|---|---|---|
+| `certs\ca.key.dpapi` | The local CA's private key | Yes, with Windows DPAPI for the current user |
+| `certs\ca.crt` | The local CA's public certificate | No; it is public |
+| `debug.log` | Warnings, plus hosts and paths while Debug is on | No |
+| `proxy_restore.json` | Your original proxy setting, only while intercepting | No |
+
+Captured SAML requests and responses are held in memory only and are gone when the app closes. Per-site certificates and their key are generated per session and never stored.
 
 ---
 
@@ -121,7 +136,13 @@ Edit `VERSION` to set the version, then:
 build_saml_interceptor.bat
 ```
 
-Or run the steps manually (see `build_saml_interceptor.bat` for the full sequence).
+The script installs the pinned requirements, runs `bandit`, `pip-audit` and the tests, and only then builds the exe and prints its SHA-256. Any of those failing stops the build. CI runs the same script on Windows for every push and pull request.
+
+To run the tests on their own:
+
+```
+python -m unittest discover -s tests
+```
 
 **Python 3.10+ required.** Tested on Python 3.14.
 
@@ -131,6 +152,9 @@ Or run the steps manually (see `build_saml_interceptor.bat` for the full sequenc
 
 ### Traffic Impact
 The proxy routes **all system HTTPS traffic** through itself while active. Stop intercepting as soon as you're done.
+
+### Untrusted Upstream Certificates
+The proxy verifies the real server's certificate before relaying anything. An IdP or SP that presents a self-signed certificate, or one issued by a CA that Windows does not trust, is refused with a `502` page naming the reason. Add the issuing CA to the Windows trust store to inspect such a server.
 
 ### Browser Compatibility
 | Browser | Works | Notes |
@@ -162,4 +186,4 @@ The `wids` claim contains directory role template IDs. These are static and well
 
 ## License
 
-MIT
+[MIT](LICENSE)

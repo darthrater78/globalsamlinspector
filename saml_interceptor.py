@@ -1006,7 +1006,8 @@ _MONO_H1  = ('Consolas', 11, 'bold')
 _MONO_H2  = ('Consolas', 10, 'bold')
 
 _REPO_URL     = 'https://github.com/darthrater78/globalsamlinspector'
-_RELEASES_URL = _REPO_URL + '/releases/latest'
+_RELEASES_URL = (_REPO_URL + '/releases/latest' if __version__ == 'dev'
+                 else f'{_REPO_URL}/releases/tag/v{__version__}')
 
 PROXY_HOST = '127.0.0.1'
 PROXY_PORT = 8080
