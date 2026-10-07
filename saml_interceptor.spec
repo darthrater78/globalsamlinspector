@@ -12,7 +12,6 @@ a = Analysis(
     hiddenimports=[
         # cryptography Rust/cffi internals PyInstaller misses
         'cryptography.hazmat.bindings._rust',
-        'cryptography.hazmat.bindings._rust.x509',
         'cryptography.hazmat.backends.openssl',
         'cryptography.hazmat.backends.openssl.backend',
         'cryptography.hazmat.primitives.asymmetric.padding',

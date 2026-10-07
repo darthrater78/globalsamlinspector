@@ -38,7 +38,7 @@ import urllib.parse
 import xml.dom.minidom
 import tkinter as tk
 from concurrent.futures import ThreadPoolExecutor
-from tkinter import ttk, scrolledtext, messagebox
+from tkinter import ttk, messagebox
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -272,7 +272,6 @@ _WIDS_ROLES = {
     '4ba39ca4-527c-499a-b93d-d9b492c50246': 'Partner Tier1 Support',
     'e00e864a-17c5-4a4b-9c06-f5b95a8d5bd8': 'Partner Tier2 Support',
     '95e79109-95c0-4d8e-aee3-d01accf2d47b': 'Guest User',
-    '2b499bcd-da44-4968-8aec-78e1674fa64d': 'Guest Inviter',
 }
 
 
@@ -971,28 +970,43 @@ class SAMLFlow:
         self.w_resp_xml     = None
         self.w_req_xml      = None
         self.w_raw          = None
-        self.w_waiting      = None  # unused; kept for compat
 
 
 # ─── GUI palette ──────────────────────────────────────────────────────────────
 
-_BG   = '#1e1e1e'
-_BG2  = '#252526'
-_BG3  = '#2d2d2d'
-_FG   = '#d4d4d4'
-_FG2  = '#858585'
-_SEL  = '#094771'
-_GRN  = '#0e7a0d'
-_RED  = '#b71c1c'
-_TEAL = '#4ec9b0'
-_ERR  = '#f44747'
-_YEL  = '#dcdcaa'
-_BLU  = '#9cdcfe'
-_GRY  = '#6a737d'
-_OK   = '#4ec9b0'
-_WARN = '#ce9178'
-_FONT = ('Segoe UI', 9)
-_MONO = ('Consolas', 10)
+# Every colour and font the UI uses is named here; DESIGN.md documents the roles.
+_BG    = '#1e1e1e'   # content surface
+_BG2   = '#252526'   # tab strip
+_BG3   = '#2d2d2d'   # toolbar, inactive tabs
+_BTN   = '#3c3c3c'   # neutral button
+_FG    = '#d4d4d4'   # text
+_FG2   = '#8f8f8f'   # dim text on _BG
+_FG2R  = '#b0b0b0'   # dim text on raised surfaces (_BG3, _BTN)
+_SEL   = '#094771'   # text selection
+_GRN   = '#0e7a0d'   # start action
+_RED   = '#b71c1c'   # stop action
+_ON_ACCENT = '#ffffff'   # text on _GRN / _RED
+_TEAL  = '#4ec9b0'   # links, focus ring, positive status
+_AMBER = '#e8b339'   # interception active
+_ERR   = '#ff7b72'   # error text
+_YEL   = '#dcdcaa'   # field labels
+_BLU   = '#9cdcfe'   # headings
+_GRY   = '#6a737d'   # rules and dividers
+_OK    = '#4ec9b0'
+_WARN  = '#ce9178'
+_XMLTAG = '#569cd6'
+_BLOB   = '#6a9955'
+_FONT     = ('Segoe UI', 9)
+_FONT_SM  = ('Segoe UI', 8)
+_FONT_LG  = ('Segoe UI', 10, 'bold')
+_FONT_EMPTY = ('Segoe UI', 11)
+_MONO     = ('Consolas', 10)
+_MONO_SM  = ('Consolas', 9)
+_MONO_H1  = ('Consolas', 11, 'bold')
+_MONO_H2  = ('Consolas', 10, 'bold')
+
+_REPO_URL     = 'https://github.com/darthrater78/globalsamlinspector'
+_RELEASES_URL = _REPO_URL + '/releases/latest'
 
 PROXY_HOST = '127.0.0.1'
 PROXY_PORT = 8080
@@ -1025,9 +1039,16 @@ class App:
     # ── Build main window ─────────────────────────────────────────────────────
 
     def _build_ui(self):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)   # crisp text on scaled displays
+        except Exception:
+            _log.debug("could not set DPI awareness", exc_info=True)
         r = tk.Tk()
         r.title(f'SAML Interceptor  v{__version__}')
-        r.geometry('1380x800')
+        scale = r.winfo_fpixels('1i') / 96
+        r.geometry(f'{min(int(1380 * scale), r.winfo_screenwidth() - 80)}x'
+                   f'{min(int(800 * scale), r.winfo_screenheight() - 120)}')
+        r.minsize(int(1180 * scale), int(480 * scale))
         r.configure(bg=_BG)
         r.protocol('WM_DELETE_WINDOW', self._close)
         try:
@@ -1042,59 +1063,67 @@ class App:
         s.configure('TLabel',           background=_BG, foreground=_FG)
         s.configure('TPanedwindow',     background=_BG)
         s.configure('TNotebook',        background=_BG2, tabmargins=[0, 2, 0, 0])
-        s.configure('TNotebook.Tab',    background=_BG3, foreground=_FG2,
-                    padding=[14, 6], font=('Segoe UI', 9))
+        s.configure('TNotebook.Tab',    background=_BG3, foreground=_FG2R,
+                    padding=[14, 6], font=_FONT)
         s.map('TNotebook.Tab',          background=[('selected', _BG)],
                                         foreground=[('selected', _FG)])
         # Sub-notebook tabs slightly smaller
         s.configure('Sub.TNotebook',        background=_BG2, tabmargins=[0, 1, 0, 0])
-        s.configure('Sub.TNotebook.Tab',    background=_BG3, foreground=_FG2,
-                    padding=[10, 4], font=('Segoe UI', 8))
+        s.configure('Sub.TNotebook.Tab',    background=_BG3, foreground=_FG2R,
+                    padding=[10, 4], font=_FONT_SM)
+        s.configure('TScrollbar',           background=_BTN, troughcolor=_BG2, bordercolor=_BG2,
+                    arrowcolor=_FG2R, lightcolor=_BTN, darkcolor=_BTN)
+        s.map('TScrollbar',                 background=[('active', _GRY)])
         s.map('Sub.TNotebook.Tab',          background=[('selected', _BG2)],
                                             foreground=[('selected', _FG)])
 
         # ── Toolbar ───────────────────────────────────────────────────────
-        bar = tk.Frame(r, bg=_BG3, height=50)
+        bar = tk.Frame(r, bg=_BG3)
         bar.pack(fill='x')
-        bar.pack_propagate(False)
 
-        self._go_btn = tk.Button(bar, text='▶  Start Intercepting',
-            command=self._toggle, bg=_GRN, fg='white',
-            font=('Segoe UI', 10, 'bold'), relief='flat', padx=14, pady=9, cursor='hand2')
-        self._go_btn.pack(side='left', padx=10, pady=6)
+        def button(text, cmd, side='left', **kw):
+            opts = dict(bg=_BTN, fg=_FG, font=_FONT, relief='flat', padx=10, pady=9,
+                        cursor='hand2', highlightthickness=1,
+                        highlightbackground=_BG3, highlightcolor=_TEAL)   # keyboard focus ring
+            opts.update(kw)
+            b = tk.Button(bar, text=text, command=cmd, **opts)
+            b.pack(side=side, padx=3, pady=6)
+            return b
 
-        _btn = lambda text, cmd: tk.Button(bar, text=text, command=cmd,
-            bg='#3c3c3c', fg=_FG, font=_FONT, relief='flat',
-            padx=10, pady=9, cursor='hand2')
+        def divider(side='left'):
+            tk.Frame(bar, bg=_GRY, width=1).pack(side=side, fill='y', padx=8, pady=12)
 
-        _btn('Install CA', self._install_ca).pack(side='left', padx=3, pady=6)
-        _btn('Remove CA',  self._remove_ca ).pack(side='left', padx=3, pady=6)
-        _btn('Regen CA',   self._regen_ca  ).pack(side='left', padx=3, pady=6)
-        _btn('View Cert',  self._view_cert ).pack(side='left', padx=3, pady=6)
-        _btn('Clear',      self._clear     ).pack(side='left', padx=3, pady=6)
+        tk.Frame(bar, bg=_BG3, width=7).pack(side='left')
+        self._go_btn = button('▶  Start Intercepting', self._toggle,
+                              bg=_GRN, fg=_ON_ACCENT, font=_FONT_LG, padx=14)
+        divider()
+        button('Install CA', self._install_ca)
+        button('Remove CA',  self._remove_ca)
+        button('Regen CA',   self._regen_ca)
+        button('View Cert',  self._view_cert)
+        divider()
+        button('Clear',      self._clear)
 
-        self._status = tk.Label(bar, text='● Stopped', bg=_BG3, fg=_ERR, font=_FONT)
+        self._status = tk.Label(bar, text='● Stopped', bg=_BG3, fg=_FG2R, font=_FONT)
         self._status.pack(side='left', padx=16)
 
-        self._ca_status = tk.Label(bar, text='CA …', bg=_BG3, fg=_FG2, font=_FONT)
+        self._ca_status = tk.Label(bar, text='CA …', bg=_BG3, fg=_FG2R, font=_FONT)
         self._ca_status.pack(side='left', padx=6)
 
-        tk.Label(bar, text=f'Proxy  {PROXY_HOST}:{PROXY_PORT}',
-                 bg=_BG3, fg=_FG2, font=('Consolas', 9)).pack(side='right', padx=14)
-
-        tk.Button(bar, text='Open Log', command=self._open_log,
-                  bg='#3c3c3c', fg=_FG, font=_FONT, relief='flat',
-                  padx=10, pady=9, cursor='hand2'
-                  ).pack(side='right', padx=3, pady=6)
-
-        self._debug_btn = tk.Button(bar, text='Debug: Off', command=self._toggle_debug,
-                  bg='#3c3c3c', fg=_FG2, font=_FONT, relief='flat',
-                  padx=10, pady=9, cursor='hand2')
-        self._debug_btn.pack(side='right', padx=3, pady=6)
+        tk.Frame(bar, bg=_BG3, width=7).pack(side='right')
+        button('Release notes', lambda: webbrowser.open(_RELEASES_URL), side='right',
+               bg=_BG3, fg=_TEAL)
+        button('GitHub', lambda: webbrowser.open(_REPO_URL), side='right', bg=_BG3, fg=_TEAL)
+        divider('right')
+        button('Open Log', self._open_log, side='right')
+        self._debug_btn = button('Debug: Off', self._toggle_debug, side='right', fg=_FG2R)
 
         # ── Flow notebook ────────────────────────────────────────────────
         self._nb = ttk.Notebook(r)
         self._nb.pack(fill='both', expand=True)
+        self._nb.bind('<Button-2>', self._on_tab_click)    # middle-click closes a flow
+        self._nb.bind('<Button-3>', self._on_tab_click)
+        r.bind('<Control-w>', lambda e: self._close_flow(self._current_flow()))
 
         # Empty-state frame shown when no flows exist
         self._empty = tk.Frame(self._nb, bg=_BG)
@@ -1102,7 +1131,7 @@ class App:
         tk.Label(self._empty,
                  text='Start intercepting, then trigger a SAML login.\n'
                       'Each login attempt will appear as a tab named by email address.',
-                 bg=_BG, fg=_FG2, font=('Segoe UI', 11), justify='center'
+                 bg=_BG, fg=_FG2, font=_FONT_EMPTY, justify='center'
                  ).place(relx=0.5, rely=0.5, anchor='center')
 
     # ── Flow tab builder ──────────────────────────────────────────────────────
@@ -1111,7 +1140,7 @@ class App:
         frame = tk.Frame(self._nb, bg=_BG)
 
         # Remove empty-state tab if this is our first flow
-        if len(self._flows) == 1 and self._empty.winfo_ismapped():
+        if str(self._empty) in self._nb.tabs():
             self._nb.forget(self._empty)
 
         self._nb.add(frame, text=f'  Flow {flow.num}  ')
@@ -1125,23 +1154,35 @@ class App:
         flow.w_req_sum  = self._make_text_tab(sub, 'Request')
         flow.w_resp_xml = self._make_text_tab(sub, 'Resp. XML')
         flow.w_req_xml  = self._make_text_tab(sub, 'Req. XML')
-        flow.w_raw      = self._make_text_tab(sub, 'Raw')
+        flow.w_raw      = self._make_text_tab(sub, 'Raw', wrap='char')   # one very long line
 
         # Show waiting placeholder as text (avoids z-order issues with a floating Label)
         flow.w_resp_sum.configure(state='normal')
         flow.w_resp_sum.insert('end', '\n\n\n  Waiting for SAMLResponse…', 'dim')
         flow.w_resp_sum.configure(state='disabled')
 
-    def _make_text_tab(self, nb, title: str) -> scrolledtext.ScrolledText:
+    def _make_text_tab(self, nb, title: str, wrap: str = 'none') -> tk.Text:
         frame = tk.Frame(nb, bg=_BG)
         nb.add(frame, text=f' {title} ')
-        t = scrolledtext.ScrolledText(frame, bg=_BG, fg=_FG, font=_MONO,
-            wrap='none', insertbackground='white', selectbackground=_SEL,
+        t = tk.Text(frame, bg=_BG, fg=_FG, font=_MONO,
+            wrap=wrap, insertbackground=_FG, selectbackground=_SEL,
             relief='flat', borderwidth=0, state='disabled')
-        t.pack(fill='both', expand=True)
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        ys = ttk.Scrollbar(frame, orient='vertical', command=t.yview)
+        t.configure(yscrollcommand=ys.set)
+        t.grid(row=0, column=0, sticky='nsew')
+        ys.grid(row=0, column=1, sticky='ns')
+        if wrap == 'none':
+            xs = ttk.Scrollbar(frame, orient='horizontal', command=t.xview)
+            t.configure(xscrollcommand=xs.set)
+            xs.grid(row=1, column=0, sticky='ew')
+        # A read-only Text does not take focus on click, so a selection could not be copied.
+        t.bind('<Button-1>', lambda e: t.focus_set())
+        t.bind('<Button-3>', lambda e: self._text_menu(e, t))
         # Text tags
-        t.tag_configure('h1',    foreground=_BLU,  font=('Consolas', 11, 'bold'))
-        t.tag_configure('h2',    foreground=_BLU,  font=('Consolas', 10, 'bold'))
+        t.tag_configure('h1',    foreground=_BLU,  font=_MONO_H1)
+        t.tag_configure('h2',    foreground=_BLU,  font=_MONO_H2)
         t.tag_configure('sep',   foreground=_GRY)
         t.tag_configure('dim',   foreground=_FG2)
         t.tag_configure('label', foreground=_YEL)
@@ -1149,13 +1190,60 @@ class App:
         t.tag_configure('ok',    foreground=_OK)
         t.tag_configure('warn',  foreground=_WARN)
         t.tag_configure('err',   foreground=_ERR)
-        t.tag_configure('blob',  foreground='#6a9955', font=('Consolas', 9))
-        t.tag_configure('xmltag',foreground='#569cd6')
+        t.tag_configure('blob',  foreground=_BLOB, font=_MONO_SM)
+        t.tag_configure('xmltag',foreground=_XMLTAG)
         return t
+
+    def _menu(self) -> tk.Menu:
+        return tk.Menu(self._root, tearoff=0, bg=_BG3, fg=_FG,
+                       activebackground=_SEL, activeforeground=_FG)
+
+    def _text_menu(self, event, widget: tk.Text):
+        def copy(text: str):
+            self._root.clipboard_clear()
+            self._root.clipboard_append(text)
+        menu = self._menu()
+        menu.add_command(label='Copy', command=lambda: copy(widget.get('sel.first', 'sel.last')),
+                         state='normal' if widget.tag_ranges('sel') else 'disabled')
+        menu.add_command(label='Copy all', command=lambda: copy(widget.get('1.0', 'end-1c')))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    # ── Closing flows ─────────────────────────────────────────────────────────
+
+    def _current_flow(self):
+        selected = self._nb.select()
+        return next((f for f in self._flows if str(f.tab_frame) == selected), None)
+
+    def _on_tab_click(self, event):
+        try:
+            tab_id = self._nb.tabs()[self._nb.index(f'@{event.x},{event.y}')]
+        except (tk.TclError, IndexError):
+            return
+        flow = next((f for f in self._flows if str(f.tab_frame) == tab_id), None)
+        if flow is None:
+            return
+        if event.num == 2:
+            self._close_flow(flow)
+            return
+        menu = self._menu()
+        menu.add_command(label='Close this flow', command=lambda: self._close_flow(flow))
+        menu.add_command(label='Close all flows', command=self._clear)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _close_flow(self, flow):
+        if flow is None:
+            return
+        self._nb.forget(flow.tab_frame)
+        flow.tab_frame.destroy()
+        self._flows.remove(flow)
+        if self._by_req_id.get(flow.request_id) is flow:
+            del self._by_req_id[flow.request_id]
+        if not self._flows:
+            self._nb.add(self._empty, text='  No flows yet  ')
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
-    def _render_summary(self, cap: dict, widget: scrolledtext.ScrolledText):
+    def _render_summary(self, cap: dict, widget: tk.Text):
         widget.configure(state='normal')
         widget.delete('1.0', 'end')
         for tag, text in cap.get('summary') or _build_summary(cap):
@@ -1177,7 +1265,7 @@ class App:
                 widget.insert('end', text, tag)
         widget.configure(state='disabled')
 
-    def _render_xml(self, cap: dict, widget: scrolledtext.ScrolledText):
+    def _render_xml(self, cap: dict, widget: tk.Text):
         decoded = cap.get('decoded', '')
         widget.configure(state='normal')
         widget.delete('1.0', 'end')
@@ -1199,7 +1287,7 @@ class App:
                     widget.insert('end', line, 'value')
         widget.configure(state='disabled')
 
-    def _render_raw(self, flow: SAMLFlow, widget: scrolledtext.ScrolledText):
+    def _render_raw(self, flow: SAMLFlow, widget: tk.Text):
         widget.configure(state='normal')
         widget.delete('1.0', 'end')
         if flow.request:
@@ -1302,7 +1390,7 @@ class App:
             self._sysproxy.enable(PROXY_HOST, PROXY_PORT)
             self._running = True
             self._go_btn.configure(text='■  Stop Intercepting', bg=_RED)
-            self._status.configure(text='● Intercepting', fg=_TEAL)
+            self._status.configure(text=f'● Intercepting on {PROXY_HOST}:{PROXY_PORT}', fg=_AMBER)
         except Exception as exc:
             messagebox.showerror('Error', f'Could not start proxy:\n{exc}')
 
@@ -1311,10 +1399,10 @@ class App:
         self._proxy.stop()
         self._running = False
         self._go_btn.configure(text='▶  Start Intercepting', bg=_GRN)
-        self._status.configure(text='● Stopped', fg=_ERR)
+        self._status.configure(text='● Stopped', fg=_FG2R)
 
     def _update_ca_status(self):
-        self._ca_status.configure(text='CA: Checking…', fg=_FG2)
+        self._ca_status.configure(text='CA: Checking…', fg=_FG2R)
         def _check():
             installed = self._certs.is_ca_installed()
             self._root.after(0, lambda: self._ca_status.configure(
@@ -1338,9 +1426,19 @@ class App:
                 f'→ Trusted Root Certification Authorities')
 
     def _remove_ca(self):
+        if not messagebox.askyesno('Remove CA',
+                'Remove the local CA from your Trusted Root store?\n\n'
+                'HTTPS flows cannot be decoded until it is installed again.'):
+            return
         self._certs.uninstall_ca()
         self._update_ca_status()
-        messagebox.showinfo('CA Removed', 'Local CA removed from Trusted Root store.')
+        if self._certs.is_ca_installed():
+            messagebox.showwarning('CA Not Removed',
+                'certutil could not remove the CA.  Remove it manually:\n\n'
+                'certmgr.msc → Trusted Root Certification Authorities → Certificates\n'
+                f'→ delete "{self._certs._CA_CN}"')
+        else:
+            messagebox.showinfo('CA Removed', 'Local CA removed from Trusted Root store.')
 
     def _view_cert(self):
         p = self._certs.ca_cert_path
@@ -1377,9 +1475,9 @@ class App:
         _log.setLevel(level)
         _log_handler.setLevel(level)
         if self._debug_on:
-            self._debug_btn.configure(text='Debug: On', bg=_TEAL, fg='black')
+            self._debug_btn.configure(text='Debug: On', bg=_TEAL, fg=_BG)
         else:
-            self._debug_btn.configure(text='Debug: Off', bg='#3c3c3c', fg=_FG2)
+            self._debug_btn.configure(text='Debug: Off', bg=_BTN, fg=_FG2R)
 
     def _open_log(self):
         log_path = _LOG_DIR / 'debug.log'
@@ -1389,8 +1487,13 @@ class App:
             messagebox.showinfo('No Log', f'Debug log not yet created.\n{log_path}')
 
     def _clear(self):
+        if self._flows and not messagebox.askyesno(
+                'Clear captures', f'Discard {len(self._flows)} captured flow(s)?'):
+            return
         for flow in self._flows:
-            try: self._nb.forget(flow.tab_frame)
+            try:
+                self._nb.forget(flow.tab_frame)
+                flow.tab_frame.destroy()
             except Exception: _log.debug("error removing flow tab", exc_info=True)
         self._flows.clear()
         self._by_req_id.clear()
