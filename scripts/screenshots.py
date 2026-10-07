@@ -102,7 +102,8 @@ def _window_box(root) -> tuple:
         hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
         if ctypes.windll.dwmapi.DwmGetWindowAttribute(
                 hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)) == 0:
-            return rect.left, rect.top, rect.right, rect.bottom
+            # The last column and row are a border blended with whatever is behind.
+            return rect.left, rect.top, rect.right - 1, rect.bottom - 1
     frame = root.winfo_rootx() - root.winfo_x()
     title = root.winfo_rooty() - root.winfo_y()
     left, top = root.winfo_x(), root.winfo_y()
