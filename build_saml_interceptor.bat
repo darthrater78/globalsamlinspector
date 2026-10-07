@@ -73,7 +73,7 @@ echo [+] version_info.txt written
 :: ── Install / upgrade dependencies ───────────────────────────────────────────
 echo.
 echo [*] Checking dependencies...
-!PY! -m pip install --quiet --upgrade cryptography pyinstaller pillow bandit
+!PY! -m pip install --quiet -r requirements.txt
 if errorlevel 1 ( echo [ERROR] pip install failed & pause & exit /b 1 )
 echo [+] Dependencies OK
 

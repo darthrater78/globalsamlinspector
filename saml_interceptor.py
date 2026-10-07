@@ -26,8 +26,9 @@ import queue
 import select
 import socket
 import winreg
-import hashlib
 import ctypes
+import tempfile
+import ipaddress
 import logging
 import threading
 import traceback
@@ -56,7 +57,6 @@ try:
     from cryptography.x509.oid import NameOID
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
-    from cryptography.hazmat.backends import default_backend
     CRYPTO_OK = True
 except ImportError:
     CRYPTO_OK = False
@@ -384,29 +384,65 @@ def _build_summary(cap: dict) -> list:
     return out
 
 
+# ─── DPAPI (protects the CA private key at rest) ──────────────────────────────
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [('cbData', ctypes.c_uint32), ('pbData', ctypes.POINTER(ctypes.c_char))]
+
+
+def _dpapi(data: bytes, protect: bool) -> bytes:
+    """Encrypt or decrypt bytes with the current Windows user's DPAPI key."""
+    crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    buf = ctypes.create_string_buffer(data, len(data))
+    src = _DataBlob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    out = _DataBlob()
+    fn  = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    # 0x1 = CRYPTPROTECT_UI_FORBIDDEN: fail instead of prompting
+    if not fn(ctypes.byref(src), None, None, None, None, 0x1, ctypes.byref(out)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(out.pbData, out.cbData)
+    finally:
+        kernel32.LocalFree(out.pbData)
+
+
 # ─── Certificate manager ──────────────────────────────────────────────────────
 
 class CertManager:
-    _CA_CN = 'SAML Interceptor Local CA'
-    _DIR   = Path(os.environ.get('APPDATA', '.')) / 'SAMLInterceptor' / 'certs'
+    _CA_CN    = 'SAML Interceptor Local CA'
+    _DIR      = Path(os.environ.get('APPDATA', '.')) / 'SAMLInterceptor' / 'certs'
+    _KEY_FILE = 'ca.key.dpapi'
 
     def __init__(self):
         self._DIR.mkdir(parents=True, exist_ok=True)
-        self._ca_key  = None
-        self._ca_cert = None
-        self._domain_cache: dict = {}
+        self._ca_key   = None
+        self._ca_cert  = None
+        self._leaf_key = None
+        self._ctx_cache: dict = {}
         self._lock = threading.Lock()
         self._load_or_create_ca()
 
     def _load_or_create_ca(self):
-        kp, cp = self._DIR / 'ca.key', self._DIR / 'ca.crt'
+        kp, cp = self._DIR / self._KEY_FILE, self._DIR / 'ca.crt'
+        legacy = self._DIR / 'ca.key'
+        if legacy.exists():
+            # Earlier versions stored the CA key as plaintext PEM: re-wrap it, then remove it.
+            if cp.exists() and not kp.exists():
+                kp.write_bytes(_dpapi(legacy.read_bytes(), protect=True))
+            legacy.unlink()
+        self._purge_leaf_files()
         if kp.exists() and cp.exists():
-            with open(kp, 'rb') as f:
-                self._ca_key = serialization.load_pem_private_key(f.read(), password=None)
-            with open(cp, 'rb') as f:
-                self._ca_cert = x509.load_pem_x509_certificate(f.read())
-            return
-        self._ca_key = rsa.generate_private_key(65537, 2048, default_backend())
+            try:
+                self._ca_key = serialization.load_pem_private_key(
+                    _dpapi(kp.read_bytes(), protect=False), password=None)
+                self._ca_cert = x509.load_pem_x509_certificate(cp.read_bytes())
+                return
+            except (OSError, ValueError):
+                # e.g. profile copied to another machine or user: the key is unrecoverable
+                _log.warning("stored CA key could not be decrypted; generating a new CA",
+                             exc_info=True)
+        self._ca_key = rsa.generate_private_key(65537, 2048)
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, self._CA_CN),
                           x509.NameAttribute(NameOID.ORGANIZATION_NAME, 'SAMLInterceptor')])
         self._ca_cert = (
@@ -417,54 +453,80 @@ class CertManager:
             .not_valid_before(datetime.now(timezone.utc))
             .not_valid_after(datetime.now(timezone.utc) + timedelta(days=3650))
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(
+                digital_signature=True, key_cert_sign=True, crl_sign=True,
+                content_commitment=False, key_encipherment=False, data_encipherment=False,
+                key_agreement=False, encipher_only=False, decipher_only=False), critical=True)
             .add_extension(x509.SubjectKeyIdentifier.from_public_key(self._ca_key.public_key()),
                            critical=False)
-            .sign(self._ca_key, hashes.SHA256(), default_backend())
+            .sign(self._ca_key, hashes.SHA256())
         )
-        with open(kp, 'wb') as f:
-            f.write(self._ca_key.private_bytes(serialization.Encoding.PEM,
-                serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
-        with open(cp, 'wb') as f:
-            f.write(self._ca_cert.public_bytes(serialization.Encoding.PEM))
+        kp.write_bytes(_dpapi(self._ca_key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption()), protect=True))
+        cp.write_bytes(self._ca_cert.public_bytes(serialization.Encoding.PEM))
+
+    def _purge_leaf_files(self):
+        """Earlier versions cached per-domain certs and plaintext keys on disk; remove them."""
+        for p in self._DIR.iterdir():
+            if p.suffix in ('.crt', '.key', '.pem') and p.name != 'ca.crt':
+                p.unlink(missing_ok=True)
 
     @property
     def ca_cert_path(self) -> Path:
         return self._DIR / 'ca.crt'
 
-    def leaf_cert_files(self, domain: str) -> tuple:
+    def leaf_context(self, domain: str) -> ssl.SSLContext:
+        """TLS server context presenting a cert for `domain` signed by the local CA."""
         with self._lock:
-            if domain in self._domain_cache:
-                return self._domain_cache[domain]
-            tag = hashlib.md5(domain.encode(), usedforsecurity=False).hexdigest()[:10]
-            cp, kp = self._DIR / f'{tag}.crt', self._DIR / f'{tag}.key'
-            if not cp.exists():
-                key = rsa.generate_private_key(65537, 2048, default_backend())
-                cert = (
-                    x509.CertificateBuilder()
-                    .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain)]))
-                    .issuer_name(self._ca_cert.subject)
-                    .public_key(key.public_key())
-                    .serial_number(x509.random_serial_number())
-                    .not_valid_before(datetime.now(timezone.utc))
-                    .not_valid_after(datetime.now(timezone.utc) + timedelta(days=397))
-                    .add_extension(
-                        x509.SubjectAlternativeName([x509.DNSName(domain),
-                                                     x509.DNSName(f'*.{domain}')]),
-                        critical=False)
-                    .sign(self._ca_key, hashes.SHA256(), default_backend())
-                )
-                with open(kp, 'wb') as f:
-                    f.write(key.private_bytes(serialization.Encoding.PEM,
-                        serialization.PrivateFormat.TraditionalOpenSSL, serialization.NoEncryption()))
-                with open(cp, 'wb') as f:
-                    f.write(cert.public_bytes(serialization.Encoding.PEM))
-            self._domain_cache[domain] = (str(cp), str(kp))
-            return self._domain_cache[domain]
+            ctx = self._ctx_cache.get(domain)
+            if ctx is None:
+                ctx = self._ctx_cache[domain] = self._make_leaf_context(domain)
+            return ctx
+
+    def _make_leaf_context(self, domain: str) -> ssl.SSLContext:
+        if self._leaf_key is None:
+            self._leaf_key = rsa.generate_private_key(65537, 2048)   # one per session, memory only
+        try:
+            san = x509.IPAddress(ipaddress.ip_address(domain.strip('[]')))
+        except ValueError:
+            san = x509.DNSName(domain)
+        now  = datetime.now(timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, domain[:64])]))
+            .issuer_name(self._ca_cert.subject)
+            .public_key(self._leaf_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(minutes=5))
+            .not_valid_after(now + timedelta(days=397))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.SubjectAlternativeName([san]), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(
+                self._ca_key.public_key()), critical=False)
+            .sign(self._ca_key, hashes.SHA256())
+        )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        # ssl can only load key material from a file: write it, load it, delete it.
+        fd, tmp = tempfile.mkstemp(dir=self._DIR, suffix='.pem')
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(self._leaf_key.private_bytes(
+                    serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                    serialization.NoEncryption()))
+                f.write(cert.public_bytes(serialization.Encoding.PEM))
+            ctx.load_cert_chain(tmp)
+        finally:
+            Path(tmp).unlink(missing_ok=True)
+        return ctx
 
     def is_ca_installed(self) -> bool:
         r = subprocess.run(['certutil', '-store', '-user', 'Root'],
                            capture_output=True, text=True)
-        return self._CA_CN in r.stdout
+        # Match this exact cert, not just the name: a regenerated CA shares its CN.
+        thumb = self._ca_cert.fingerprint(hashes.SHA1()).hex()  # nosec B303
+        return thumb in r.stdout.replace(' ', '').lower()
 
     def install_ca(self) -> bool:
         r = subprocess.run(['certutil', '-addstore', '-user', 'Root', str(self.ca_cert_path)],
@@ -479,14 +541,13 @@ class CertManager:
         """Wipe and recreate the CA cert. Caller is responsible for reinstalling."""
         self.uninstall_ca()
         with self._lock:
-            self._domain_cache.clear()
-        for p in self._DIR.glob('*.crt'):
-            p.unlink(missing_ok=True)
-        for p in self._DIR.glob('*.key'):
-            p.unlink(missing_ok=True)
-        self._ca_key  = None
-        self._ca_cert = None
-        self._load_or_create_ca()
+            self._ctx_cache.clear()
+            self._leaf_key = None
+            (self._DIR / 'ca.crt').unlink(missing_ok=True)
+            (self._DIR / self._KEY_FILE).unlink(missing_ok=True)
+            self._ca_key  = None
+            self._ca_cert = None
+            self._load_or_create_ca()
 
 
 # ─── Windows system proxy ─────────────────────────────────────────────────────
@@ -544,11 +605,10 @@ class SAMLProxy:
         self._sock  = None
         self._alive = False
         self._pool  = None
-        self._srv_ctx: dict = {}
-        self._srv_ctx_lock = threading.Lock()
+        # Upstream servers are verified against the system trust store: the browser
+        # trusts whatever this proxy relays, so the proxy must do the verifying.
         self._up_ctx = ssl.create_default_context()
-        self._up_ctx.check_hostname = False
-        self._up_ctx.verify_mode    = ssl.CERT_NONE
+        self._up_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
     def start(self):
         self._pool  = ThreadPoolExecutor(max_workers=64, thread_name_prefix='proxy')
@@ -610,7 +670,7 @@ class SAMLProxy:
         port = int(port) if port.isdigit() else 443
         _log.info(f"CONNECT {target}")
         sock.sendall(b'HTTP/1.1 200 Connection Established\r\n\r\n')
-        ctx = self._get_srv_ctx(host)
+        ctx = self._certs.leaf_context(host)
         try:
             tls = ctx.wrap_socket(sock, server_side=True)
         except ssl.SSLError:
@@ -624,15 +684,6 @@ class SAMLProxy:
         finally:
             try: tls.close()
             except Exception: _log.debug("error closing TLS socket", exc_info=True)
-
-    def _get_srv_ctx(self, domain: str) -> ssl.SSLContext:
-        with self._srv_ctx_lock:
-            if domain not in self._srv_ctx:
-                cp, kp = self._certs.leaf_cert_files(domain)
-                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-                ctx.load_cert_chain(cp, kp)
-                self._srv_ctx[domain] = ctx
-            return self._srv_ctx[domain]
 
     def _forward(self, client, data: bytes, host: str, port: int, tls: bool):
         hdr_end     = data.find(b'\r\n\r\n')
@@ -668,7 +719,22 @@ class SAMLProxy:
             return
 
         if tls:
-            up = self._up_ctx.wrap_socket(up, server_hostname=host)
+            try:
+                up = self._up_ctx.wrap_socket(up, server_hostname=host)
+            except OSError as exc:
+                # Fail closed: never relay a server whose certificate did not verify.
+                _log.warning("upstream TLS failed for %s:%s: %s", host, port, exc)
+                up.close()
+                reason = getattr(exc, 'verify_message', '') or 'TLS handshake failed'
+                msg = (f'SAML Interceptor refused this connection: the certificate '
+                       f'presented by {host} could not be verified ({reason}).\n').encode()
+                try:
+                    client.sendall(b'HTTP/1.1 502 Bad Gateway\r\n'
+                                   b'Content-Type: text/plain; charset=utf-8\r\n'
+                                   b'Content-Length: %d\r\nConnection: close\r\n\r\n%s'
+                                   % (len(msg), msg))
+                except Exception: _log.debug("error sending 502", exc_info=True)
+                return
 
         if not tls and path.startswith('http'):
             rel  = pp.path + (f'?{pp.query}' if pp.query else '')

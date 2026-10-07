@@ -52,7 +52,7 @@ Browser ──CONNECT──▶ Local Proxy (127.0.0.1:8080)
 | Component | Description |
 |---|---|
 | `SAMLProxy` | Raw TCP server on `127.0.0.1:8080`. `ThreadPoolExecutor(64)` handles concurrent connections. Recreated on each Start so Stop→Start works without restarting the app. |
-| `CertManager` | Generates a local CA cert + RSA key on first run (stored in `%APPDATA%\SAMLInterceptor\certs\`). Issues per-domain leaf certs on demand, cached in memory. Installs/removes CA via `certutil -addstore/-delstore -user Root`. |
+| `CertManager` | Generates a local CA cert + RSA key on first run (stored in `%APPDATA%\SAMLInterceptor\certs\`; the private key is encrypted with Windows DPAPI). Issues per-domain leaf certs on demand, held in memory only. Installs/removes CA via `certutil -addstore/-delstore -user Root`. |
 | `SystemProxy` | Writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` and calls `InternetSetOptionW` to make the change live without a browser restart. Restores original settings on Stop. |
 | `_relay_scan` | Buffers client→upstream bytes on keep-alive CONNECT tunnels. Bails immediately for non-POST or non-`application/x-www-form-urlencoded` traffic (zero overhead for downloads, API calls, streaming). Only buffers small form-encoded POSTs — the exact shape of a SAMLResponse. |
 | `_build_summary` | Regex-based SAML XML parser. Extracts issuer, destination, NameID, validity window, and all attributes. Resolves Entra `wids` GUIDs to built-in role names. Renders Entra group GUIDs as clickable links to the Azure portal. |
@@ -112,7 +112,7 @@ Click **Debug: Off** to toggle detailed proxy logging. Logs write to `%APPDATA%\
 ## Building from Source
 
 ```
-pip install cryptography pyinstaller pillow
+pip install -r requirements.txt
 ```
 
 Edit `VERSION` to set the version, then:

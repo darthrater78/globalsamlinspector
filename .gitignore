@@ -33,3 +33,7 @@ venv/
 
 # Icon build artefacts
 icon_preview.png
+
+# Dev Skills session state (local only)
+.dev-skills-gates.md
+.dev-skills-handoff.md
