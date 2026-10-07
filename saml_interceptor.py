@@ -1105,12 +1105,8 @@ class App:
         divider()
         button('Clear',      self._clear)
 
-        self._status = tk.Label(bar, text='● Stopped', bg=_BG3, fg=_FG2R, font=_FONT)
-        self._status.pack(side='left', padx=16)
-
-        self._ca_status = tk.Label(bar, text='CA …', bg=_BG3, fg=_FG2R, font=_FONT)
-        self._ca_status.pack(side='left', padx=6)
-
+        # The right-hand buttons are packed before the status text: pack gives space in
+        # this order, so on a narrow window the text is clipped, never a button.
         tk.Frame(bar, bg=_BG3, width=7).pack(side='right')
         button('Release notes', lambda: webbrowser.open(_RELEASES_URL), side='right',
                bg=_BG3, fg=_TEAL)
@@ -1118,6 +1114,12 @@ class App:
         divider('right')
         button('Open Log', self._open_log, side='right')
         self._debug_btn = button('Debug: Off', self._toggle_debug, side='right', fg=_FG2R)
+
+        self._status = tk.Label(bar, text='● Stopped', bg=_BG3, fg=_FG2R, font=_FONT, anchor='w')
+        self._status.pack(side='left', padx=16)
+
+        self._ca_status = tk.Label(bar, text='CA …', bg=_BG3, fg=_FG2R, font=_FONT, anchor='w')
+        self._ca_status.pack(side='left', padx=6)
 
         # ── Flow notebook ────────────────────────────────────────────────
         self._nb = ttk.Notebook(r)

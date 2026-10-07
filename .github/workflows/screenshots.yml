@@ -1,0 +1,49 @@
+name: Screenshots
+
+# Regenerates the README screenshots on Windows from seeded sample data.
+# Run it by hand before a release whose UI changed, then commit the images
+# from the run's artifact into docs/screenshots/.
+on:
+  workflow_dispatch:
+  push:
+    branches: ['**']
+    paths:
+      - 'scripts/screenshots.py'
+      - '.github/workflows/screenshots.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: screenshots-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  capture:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      - name: Install requirements
+        run: python -m pip install --quiet -r requirements.txt
+
+      # The runner's default desktop is smaller than the app window.
+      - name: Set display resolution
+        run: Set-DisplayResolution -Width 1920 -Height 1080 -Force
+
+      - name: Capture
+        run: python scripts/screenshots.py docs/screenshots
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: screenshots
+          path: docs/screenshots/*.png
+          if-no-files-found: error
+          retention-days: 14
