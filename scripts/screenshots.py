@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import base64
+import ctypes
 import types
 from pathlib import Path
 
@@ -88,6 +89,27 @@ def _capture(kind: str, xml_text: str, host: str, ts: str, binding: str) -> dict
             'decoded': si._decode_saml_value(raw, redirect_binding=False)}   # the app's own decoder
 
 
+class _Rect(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_long) for n in ('left', 'top', 'right', 'bottom')]
+
+
+def _window_box(root) -> tuple:
+    """Screen rectangle of the window as drawn, title bar included."""
+    if sys.platform == 'win32':
+        # The plain window rectangle includes invisible resize borders; ask DWM
+        # for the visible frame instead (9 = DWMWA_EXTENDED_FRAME_BOUNDS).
+        rect = _Rect()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        if ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)) == 0:
+            return rect.left, rect.top, rect.right, rect.bottom
+    frame = root.winfo_rootx() - root.winfo_x()
+    title = root.winfo_rooty() - root.winfo_y()
+    left, top = root.winfo_x(), root.winfo_y()
+    return (left, top, left + root.winfo_width() + 2 * frame,
+            top + root.winfo_height() + title + frame)
+
+
 def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     app = si.App()
@@ -99,13 +121,7 @@ def main() -> None:
     def grab(name: str) -> None:
         root.update_idletasks()
         root.update()
-        # Outer window, including the title bar where the platform draws one.
-        frame = root.winfo_rootx() - root.winfo_x()
-        title = root.winfo_rooty() - root.winfo_y()
-        left, top = root.winfo_x(), root.winfo_y()
-        right = left + root.winfo_width() + 2 * frame
-        bottom = top + root.winfo_height() + title + frame
-        ImageGrab.grab(bbox=(left, top, right, bottom)).save(OUT / name, optimize=True)
+        ImageGrab.grab(bbox=_window_box(root)).save(OUT / name, optimize=True)
         print(f'saved {OUT / name}')
 
     def seeded() -> None:
