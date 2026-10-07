@@ -119,6 +119,8 @@ del /f /q version_info.txt
 echo.
 echo ============================================================
 for %%F in (%OUT%) do echo   %%~nxF   ^(%%~zF bytes^)
+echo   SHA-256 ^(publish this with the release^):
+certutil -hashfile "%OUT%" SHA256 | findstr /v /c:"hash" /c:"CertUtil"
 echo ============================================================
 echo.
 echo  To bump the version, edit VERSION and rebuild.

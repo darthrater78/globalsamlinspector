@@ -18,6 +18,7 @@ Flow:
 import os
 import re
 import sys
+import json
 import webbrowser
 import ssl
 import zlib
@@ -88,14 +89,31 @@ def _clean_xml(xml_str: str) -> str:
     return _BLOB_RE.sub(_sub, xml_str)
 
 
+_MAX_SAML = 1024 * 1024   # decoded XML bytes; real assertions are a few KB
+
+
 def _decode_saml_value(value: str, redirect_binding: bool) -> str:
+    """Decode a SAML parameter. The payload comes from whatever site is being visited."""
+    if len(value) > 2 * _MAX_SAML:
+        return '[Decode error: payload too large]'
     try:
         value = urllib.parse.unquote(value)
         rem = len(value) % 4
         if rem:
             value += '=' * (4 - rem)
         raw = base64.b64decode(value)
-        xml_bytes = zlib.decompress(raw, -15) if redirect_binding else raw
+        if redirect_binding:
+            inflater  = zlib.decompressobj(-15)
+            xml_bytes = inflater.decompress(raw, _MAX_SAML)
+            if inflater.unconsumed_tail:
+                raise ValueError('payload too large')
+        else:
+            xml_bytes = raw
+        if len(xml_bytes) > _MAX_SAML:
+            raise ValueError('payload too large')
+        # SAML forbids DTDs, and a DTD is what entity-expansion attacks need.
+        if b'\x00' in xml_bytes or b'<!DOCTYPE' in xml_bytes:
+            raise ValueError('DTD or non-UTF-8 XML is not allowed in SAML')
         return xml.dom.minidom.parseString(xml_bytes).toprettyxml(indent='  ')  # nosec B318
     except Exception as exc:
         return f'[Decode error: {exc}]\n\nRaw:\n{value}'
@@ -409,6 +427,9 @@ def _dpapi(data: bytes, protect: bool) -> bytes:
 
 # ─── Certificate manager ──────────────────────────────────────────────────────
 
+_CERTUTIL = str(Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'certutil.exe')
+
+
 class CertManager:
     _CA_CN    = 'SAML Interceptor Local CA'
     _DIR      = Path(os.environ.get('APPDATA', '.')) / 'SAMLInterceptor' / 'certs'
@@ -522,19 +543,19 @@ class CertManager:
         return ctx
 
     def is_ca_installed(self) -> bool:
-        r = subprocess.run(['certutil', '-store', '-user', 'Root'],
+        r = subprocess.run([_CERTUTIL, '-store', '-user', 'Root'],
                            capture_output=True, text=True)
         # Match this exact cert, not just the name: a regenerated CA shares its CN.
         thumb = self._ca_cert.fingerprint(hashes.SHA1()).hex()  # nosec B303
         return thumb in r.stdout.replace(' ', '').lower()
 
     def install_ca(self) -> bool:
-        r = subprocess.run(['certutil', '-addstore', '-user', 'Root', str(self.ca_cert_path)],
+        r = subprocess.run([_CERTUTIL, '-addstore', '-user', 'Root', str(self.ca_cert_path)],
                            capture_output=True, text=True)
         return r.returncode == 0
 
     def uninstall_ca(self):
-        subprocess.run(['certutil', '-delstore', '-user', 'Root', self._CA_CN],
+        subprocess.run([_CERTUTIL, '-delstore', '-user', 'Root', self._CA_CN],
                        capture_output=True, text=True)
 
     def regenerate_ca(self):
@@ -565,35 +586,69 @@ def _inet_refresh():
 
 
 class SystemProxy:
+    # Original settings are written here before the proxy is switched on, so a
+    # session that crashes or is killed can be undone on the next launch.
+    _STATE = _LOG_DIR / 'proxy_restore.json'
+
     def __init__(self):
         self._orig_enable = None
         self._orig_server = ''
 
+    @staticmethod
+    def _open():
+        return winreg.OpenKey(winreg.HKEY_CURRENT_USER, _INET_REG, 0,
+                              winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE)
+
     def enable(self, host: str, port: int):
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _INET_REG, 0, winreg.KEY_ALL_ACCESS)
-        try:    self._orig_enable, _ = winreg.QueryValueEx(key, 'ProxyEnable')
-        except FileNotFoundError: self._orig_enable = 0
-        try:    self._orig_server, _ = winreg.QueryValueEx(key, 'ProxyServer')
-        except FileNotFoundError: self._orig_server = ''
-        winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, f'{host}:{port}')
-        winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, 1)
-        winreg.CloseKey(key)
+        ours = f'{host}:{port}'
+        with self._open() as key:
+            try:    enable, _ = winreg.QueryValueEx(key, 'ProxyEnable')
+            except FileNotFoundError: enable = 0
+            try:    server, _ = winreg.QueryValueEx(key, 'ProxyServer')
+            except FileNotFoundError: server = ''
+            if enable and server == ours:
+                enable, server = 0, ''   # left over from us; never "restore" to ourselves
+            self._orig_enable, self._orig_server = int(enable), str(server)
+            self._STATE.write_text(
+                json.dumps({'enable': self._orig_enable, 'server': self._orig_server}),
+                encoding='utf-8')
+            winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, ours)
+            winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, 1)
         _inet_refresh()
 
     def disable(self):
         if self._orig_enable is None:
             return
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _INET_REG, 0, winreg.KEY_ALL_ACCESS)
-        winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, self._orig_enable)
-        winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, self._orig_server)
-        winreg.CloseKey(key)
+        with self._open() as key:
+            winreg.SetValueEx(key, 'ProxyEnable', 0, winreg.REG_DWORD, self._orig_enable)
+            winreg.SetValueEx(key, 'ProxyServer', 0, winreg.REG_SZ, self._orig_server)
+        self._orig_enable = None
+        self._STATE.unlink(missing_ok=True)
         _inet_refresh()
+
+    def recover(self) -> bool:
+        """Restore settings left behind by a session that did not exit cleanly."""
+        try:
+            state  = json.loads(self._STATE.read_text(encoding='utf-8'))
+            enable = 1 if state['enable'] else 0
+            server = state['server']
+            if not isinstance(server, str) or len(server) > 2048:
+                raise ValueError('bad server value')
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError, KeyError, TypeError):
+            _log.warning("unreadable proxy restore file; switching the proxy off", exc_info=True)
+            enable, server = 0, ''
+        self._orig_enable, self._orig_server = enable, server
+        self.disable()
+        return True
 
 
 # ─── Proxy server ─────────────────────────────────────────────────────────────
 
-_BUF     = 65536
-_TIMEOUT = 15
+_BUF      = 65536
+_TIMEOUT  = 15
+_MAX_BODY = 1024 * 1024   # request body bytes buffered for scanning; the rest is relayed
 
 
 class SAMLProxy:
@@ -613,7 +668,9 @@ class SAMLProxy:
     def start(self):
         self._pool  = ThreadPoolExecutor(max_workers=64, thread_name_prefix='proxy')
         self._sock  = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            # Windows: stop another local process from binding the same port alongside us.
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         self._sock.bind((self._host, self._port))
         self._sock.listen(256)
         self._alive = True
@@ -685,6 +742,22 @@ class SAMLProxy:
             try: tls.close()
             except Exception: _log.debug("error closing TLS socket", exc_info=True)
 
+    def _emit(self, entry: dict):
+        """Queue a capture, pre-parsed here so a slow payload cannot stall the UI thread."""
+        decoded = entry['decoded']
+        try:
+            if not decoded.startswith('[Decode error'):
+                entry['clean_xml'] = _clean_xml(decoded)
+            entry['summary'] = _build_summary(entry)
+            if entry['type'] == 'SAMLRequest':
+                entry['saml_id'] = _extract_saml_id(decoded)
+            else:
+                entry['irt']   = _extract_in_response_to(decoded)
+                entry['email'] = _extract_email(decoded)
+        except Exception:
+            _log.debug("capture pre-parse failed", exc_info=True)
+        self._ev.put(entry)
+
     def _forward(self, client, data: bytes, host: str, port: int, tls: bool):
         hdr_end     = data.find(b'\r\n\r\n')
         headers_raw = data[:hdr_end] if hdr_end != -1 else data
@@ -701,14 +774,14 @@ class SAMLProxy:
         findings = []
         if pp.query:
             findings += _find_saml(pp.query, post_body=False)
-        if method == 'POST' and body:
+        if method == 'POST' and body and len(body) < _MAX_BODY:
             findings += _find_saml(body.decode('utf-8', errors='replace'), post_body=True)
 
         ts = datetime.now().strftime('%H:%M:%S')
         for f in findings:
             entry = {'ts': ts, 'host': host, 'path': pp.path, 'method': method, **f}
             _log.info(f"Captured {f['type']} {f['binding']} from {host}{pp.path}")
-            self._ev.put(entry)
+            self._emit(entry)
 
         try:
             up = socket.create_connection((host, port), timeout=_TIMEOUT)
@@ -773,7 +846,13 @@ class SAMLProxy:
                                 buf = b''  # guard against memory runaway
                             else:
                                 buf = self._relay_scan(buf, host)
-                        dst.sendall(chunk)
+                        # Send in blocking mode: a non-blocking sendall can stop part-way
+                        # through a large upload or download and lose the rest.
+                        dst.settimeout(_TIMEOUT)
+                        try:
+                            dst.sendall(chunk)
+                        finally:
+                            dst.settimeout(0)
                     except (BlockingIOError, ssl.SSLWantReadError):
                         pass
                     except Exception:
@@ -830,7 +909,7 @@ class SAMLProxy:
                 ts = datetime.now().strftime('%H:%M:%S')
                 entry = {'ts': ts, 'host': host, 'path': pp.path, 'method': 'POST', **f}
                 _log.info(f"Captured {f['type']} {f['binding']} from {host}{pp.path} (relay)")
-                self._ev.put(entry)
+                self._emit(entry)
         except Exception:
             _log.debug("_relay_scan SAML parse error", exc_info=True)
 
@@ -854,7 +933,8 @@ class SAMLProxy:
             if line.lower().startswith('content-length:'):
                 try: cl = int(line.split(':', 1)[1].strip())
                 except ValueError: pass
-        while len(body) < cl:
+        # Buffer only what is worth scanning; _relay streams whatever is left.
+        while len(body) < min(cl, _MAX_BODY):
             chunk = sock.recv(_BUF)
             if not chunk:
                 break
@@ -863,11 +943,14 @@ class SAMLProxy:
 
     @staticmethod
     def _strip_hop_headers(data: bytes) -> bytes:
-        hop = {b'proxy-connection', b'keep-alive', b'te',
-               b'trailers', b'transfer-encoding', b'upgrade'}
-        return b'\r\n'.join(
-            l for l in data.split(b'\r\n')
+        # Headers only: the body is forwarded byte for byte. Transfer-Encoding stays,
+        # because a chunked body is relayed as it arrived.
+        hop = {b'proxy-connection', b'keep-alive', b'te', b'trailers', b'upgrade'}
+        head, sep, body = data.partition(b'\r\n\r\n')
+        head = b'\r\n'.join(
+            l for l in head.split(b'\r\n')
             if l.split(b':')[0].strip().lower() not in hop)
+        return head + sep + body
 
 
 # ─── Flow model ───────────────────────────────────────────────────────────────
@@ -931,6 +1014,12 @@ class App:
         self._flow_num  = 0
         self._build_ui()
         self._root.after(200, self._update_ca_status)
+        if self._sysproxy.recover():
+            self._root.after(300, lambda: messagebox.showinfo(
+                'Proxy settings restored',
+                'SAML Interceptor did not shut down cleanly last time and had left the '
+                'system proxy pointing at itself.\n\nYour original proxy settings have '
+                'been restored.'))
         self._poll()
 
     # ── Build main window ─────────────────────────────────────────────────────
@@ -1069,7 +1158,7 @@ class App:
     def _render_summary(self, cap: dict, widget: scrolledtext.ScrolledText):
         widget.configure(state='normal')
         widget.delete('1.0', 'end')
-        for tag, text in _build_summary(cap):
+        for tag, text in cap.get('summary') or _build_summary(cap):
             if tag == 'guid':
                 guid = text.strip()
                 url  = (f'https://portal.azure.com/#view/Microsoft_AAD_IAM/'
@@ -1088,14 +1177,15 @@ class App:
                 widget.insert('end', text, tag)
         widget.configure(state='disabled')
 
-    def _render_xml(self, decoded: str, widget: scrolledtext.ScrolledText):
+    def _render_xml(self, cap: dict, widget: scrolledtext.ScrolledText):
+        decoded = cap.get('decoded', '')
         widget.configure(state='normal')
         widget.delete('1.0', 'end')
         if decoded.startswith('[Decode error'):
             widget.insert('1.0', decoded, 'err')
             widget.configure(state='disabled')
             return
-        cleaned = _clean_xml(decoded)
+        cleaned = cap.get('clean_xml') or _clean_xml(decoded)
         for line in cleaned.splitlines(keepends=True):
             if '[base64 chars]' in line:
                 widget.insert('end', line, 'blob')
@@ -1144,17 +1234,17 @@ class App:
         kind    = cap['type']
 
         if kind == 'SAMLRequest':
-            req_id = _extract_saml_id(decoded)
+            req_id = cap['saml_id'] if 'saml_id' in cap else _extract_saml_id(decoded)
             _log.debug(f"SAMLRequest req_id={req_id!r} host={cap.get('host')}")
             flow   = self._new_flow(cap, req_id)
             flow.request = cap
-            self._render_xml(decoded, flow.w_req_xml)
+            self._render_xml(cap, flow.w_req_xml)
             # Request summary
             self._render_summary(cap, flow.w_req_sum)
             self._render_raw(flow, flow.w_raw)
 
         elif kind == 'SAMLResponse':
-            irt  = _extract_in_response_to(decoded)
+            irt  = cap['irt'] if 'irt' in cap else _extract_in_response_to(decoded)
             flow = self._by_req_id.get(irt) if irt else None
             _log.debug(f"SAMLResponse irt={irt!r} -> {'Flow '+str(flow.num) if flow else 'no match'}")
             if flow is None:
@@ -1167,10 +1257,10 @@ class App:
             if flow is None:
                 flow = self._new_flow(cap, '')
             flow.response = cap
-            flow.email    = _extract_email(decoded)
+            flow.email    = cap['email'] if 'email' in cap else _extract_email(decoded)
             self._update_tab_title(flow)
             self._render_summary(cap, flow.w_resp_sum)
-            self._render_xml(decoded, flow.w_resp_xml)
+            self._render_xml(cap, flow.w_resp_xml)
             self._render_raw(flow, flow.w_raw)
 
     # ── Poll queue ────────────────────────────────────────────────────────────

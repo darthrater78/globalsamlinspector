@@ -56,7 +56,7 @@ Browser ──CONNECT──▶ Local Proxy (127.0.0.1:8080)
 | `SystemProxy` | Writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings` and calls `InternetSetOptionW` to make the change live without a browser restart. Restores original settings on Stop. |
 | `_relay_scan` | Buffers client→upstream bytes on keep-alive CONNECT tunnels. Bails immediately for non-POST or non-`application/x-www-form-urlencoded` traffic (zero overhead for downloads, API calls, streaming). Only buffers small form-encoded POSTs — the exact shape of a SAMLResponse. |
 | `_build_summary` | Regex-based SAML XML parser. Extracts issuer, destination, NameID, validity window, and all attributes. Resolves Entra `wids` GUIDs to built-in role names. Renders Entra group GUIDs as clickable links to the Azure portal. |
-| `App` / tkinter | Dark-themed `ttk.Notebook` GUI. Each SAML login flow gets a tab named by email. Four sub-tabs per flow: Response summary, Request summary, Response XML, Raw base64. |
+| `App` / tkinter | Dark-themed `ttk.Notebook` GUI. Each SAML login flow gets a tab named by email. Five sub-tabs per flow: Response summary, Request summary, Response XML, Request XML, Raw base64. |
 
 ### SAML Capture Paths
 
@@ -105,7 +105,7 @@ The CA status indicator in the toolbar shows **CA ✓ Installed** or **CA ✗ No
 
 ### Debug Logging
 
-Click **Debug: Off** to toggle detailed proxy logging. Logs write to `%APPDATA%\SAMLInterceptor\debug.log`. Click **Open Log** to open it in your default text editor.
+Click **Debug: Off** to toggle detailed proxy logging. While it is on, the log records the host and path of every request that passes through the proxy, not only SAML traffic, so turn it off when you are done. Logs write to `%APPDATA%\SAMLInterceptor\debug.log`. Click **Open Log** to open it in your default text editor.
 
 ---
 
