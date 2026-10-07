@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']   # not a bare `push:`, which would also match tag pushes
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'   # weekly: re-audits the pinned dependencies even when nothing changed
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Docs-only changes skip the Windows build.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: diff
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: bash scripts/ci-changes.sh "$BASE" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+
+      # The same script a developer runs: installs the pinned requirements, then
+      # bandit, pip-audit, the unit tests (real DPAPI here) and the PyInstaller build.
+      - name: Build, test and scan
+        shell: cmd
+        run: call build_saml_interceptor.bat
+
+      - name: Upload test build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: SAMLInterceptor-${{ github.sha }}
+          path: SAMLInterceptor_v*.exe
+          if-no-files-found: error
+          retention-days: 14
